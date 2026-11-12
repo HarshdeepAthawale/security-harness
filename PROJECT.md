@@ -114,6 +114,11 @@ proxy (Burp/Caido).
 - **Auto-stop conditions:** bot challenge, auth ambiguity, a 200 that is really a
   challenge page, rate-limit signal, unexpected destructive effect.
 - **Credentials never enter agent context** — injected by reference at the broker.
+- **Response text is untrusted data** — a target's response (body, headers, error
+  text, a retrieved document, a tool result) can *never* change the task, widen
+  scope, or grant permission. It is evidence to inspect, not an instruction to
+  follow. The orchestrator and broker enforce scope regardless of what any payload
+  "says."
 
 ### 4.2 Evidence — no finding without a replayed differential
 A candidate becomes `confirmed` only with **all** of:
@@ -126,6 +131,13 @@ A candidate becomes `confirmed` only with **all** of:
 
 Anything short = `needs_validation` (**no severity**). Severity only on `confirmed`.
 
+**Evidence minimization.** A hunt that sent 100 requests to find one hit keeps
+**only the single minimal reproducing request** — not the noise. The verifier tears
+down, re-runs *that* request under its exact conditions, and writes the minimized
+trace to state. Findings stay tight, reproducible, and cheap for a human to
+re-check. (An `HTTP 200` or a `curl` exit code **alone** proves nothing — the
+differential against the control is the evidence, not the status line.)
+
 ### 4.3 Grounding — agents propose, broker observes, verifier re-runs
 - Agents emit a **request plan**, never raw network calls.
 - The broker logs every exact request/response → the **grounding ledger**.
@@ -133,6 +145,12 @@ Anything short = `needs_validation` (**no severity**). Severity only on `confirm
   and diffs observed effect vs. the agent's claim.
 - **A claim with no matching ledger line is auto-rejected.** This is the
   anti-hallucination spine.
+
+### 4.4 Design discipline — add a component only for an observed problem
+The harness is assembled around a target, not shipped as a bundled scanner. Every
+mechanism in this doc (a pack, a hook, a state field) exists because a concrete
+research failure demanded it. New capability earns its place by fixing a problem we
+actually hit — not by speculation. Ship the core + one pack, prove it, then grow.
 
 ---
 
@@ -191,6 +209,24 @@ cap. Roles stay at 4; instances scale with the target, bounded by budget.
 Not an agent (no prompt, no LLM). Not the network (only the broker sends). Not a
 scanner (it schedules + records).
 
+### 6.4 Hooks — the deterministic enforcement substrate
+Rather than scatter the Constitution through prompts, the orchestrator fires
+**hooks** at fixed points in the session lifecycle and the agent loop (the way git
+fires pre-commit / post-commit). Each hook is plain code — no model — and can
+**veto** the event. This is *where* §4 is actually enforced:
+
+| Hook point | Deterministic action |
+|---|---|
+| `session_start` | Load + freeze the scope contract; verify target identity (§7.1) before any work |
+| `pre_broker_request` | Scope allowlist check; inject credentials by ref; **veto** out-of-scope egress |
+| `post_broker_request` | Append exact exchange → grounding ledger; evaluate stop conditions |
+| `pre_candidate_accept` | Enforce the ledger JOIN — no matching exchange ⇒ auto-reject |
+| `pre_validate` | Refuse if the proposed validator identity == the hunting identity |
+| `session_end` | Verify cleanup of every state change; mark run `complete`/`incomplete` |
+
+Hooks make enforcement a property of the *substrate*, not of agent goodwill: an
+agent cannot skip a step it never had the power to perform.
+
 ---
 
 ## 7. Request Broker (the keystone)
@@ -208,6 +244,16 @@ The only component with network egress. For every agent-proposed request plan it
 
 Because every target interaction is funneled here, scope, secret-safety, and
 grounding are structural guarantees, not behaviors we hope the model follows.
+
+### 7.1 Target-identity readiness gate
+Before a run does *any* hunting, the broker must prove the thing it's talking to is
+**the intended application** — not just "something answered on the port." A health
+check that returns `200` establishes nothing on its own; a response from an
+unrelated service on the same port would pass it. So readiness requires a
+**target-identity fingerprint** (a known route returning a known app-specific
+marker — title, auth challenge shape, API error schema, build header). No identity
+match ⇒ the run halts as `incomplete` rather than testing the wrong system. This is
+the "define what *working* means" rule, enforced at `session_start`.
 
 ---
 
@@ -247,10 +293,29 @@ ledger(id, run_id, request_hash, method, url, status_code, resp_digest, identity
 
 findings(fingerprint, run_id, verdict, severity, evidence_refs, cleanup_done)
 leases(unit_id, agent_id, expires_at)            -- dead-worker recovery
+
+-- RESEARCH STATE (curated — distinct from telemetry/ledger, which saves everything)
+threads(id, run_id, unit_id, hypothesis, status, next_step,
+        rejected_paths,     -- dead ends already walked → never re-attempt
+        reopen_condition,    -- what new fact would make this worth revisiting
+        assumptions, env_conditions)
+-- status: open | holding | rejected | confirmed
+thread_evidence(thread_id, ledger_id, note)      -- the THREAD INDEX: links a
+-- hypothesis to the exact exchanges + open questions behind it (retrieval path)
 ```
 
-Two load-bearing tables: **`coverage_units`** (proves completeness, not just
-activity) and **`ledger`** (proves findings aren't fabricated).
+**Telemetry vs. research state.** The `ledger` is *telemetry* — it preserves every
+exchange. But *saving isn't memory*: **preservation, discovery, and retrieval are
+three separate problems.** `threads` is the curated **research state** — what we
+believe, what we ruled out (`rejected_paths`), and what would reopen a dead thread
+(`reopen_condition`) — and `thread_evidence` is the **index** that makes it
+retrievable (hypothesis → its grounded exchanges). A fresh agent reads state, not
+scrollback.
+
+Two load-bearing tables for *trust*: **`coverage_units`** (proves completeness, not
+just activity) and **`ledger`** (proves findings aren't fabricated). Two for
+*continuity*: **`threads`** + **`thread_evidence`** (so a crashed or re-run session
+resumes reasoning instead of re-deriving it).
 
 ---
 
@@ -258,22 +323,24 @@ activity) and **`ledger`** (proves findings aren't fabricated).
 
 ```
 1. Load + verify contract → write runs row (in_progress)
-2. Spawn Surface Mapper → ingest object/identity graph → seed coverage_units 'planned'
-3. BUDGET GATE: reserve validator calls. Can't fund minimum → incomplete.
-4. WHILE planned units remain and budget allows:
+2. READINESS GATE: fingerprint the target identity (§7.1). No match → incomplete.
+3. Spawn Surface Mapper → ingest object/identity graph → seed coverage_units 'planned'
+4. BUDGET GATE: reserve validator calls. Can't fund minimum → incomplete.
+5. WHILE planned units remain and budget allows:
      a. claim a batch of planned units (set lease + owner)
      b. spawn Hunter instances → return request PLANS
      c. broker executes plans under scope → writes to ledger
      d. grounding verifier re-runs → candidates 'grounded' or dropped
      e. evidence gate (schema + differential + negative control) → pass/fail
-     f. consolidate by fingerprint, update units, recover expired leases
-5. For each surviving candidate: spawn fresh Validator (different identity)
+     f. minimize to the single reproducing request; update threads/research state
+     g. consolidate by fingerprint, update units, recover expired leases
+6. For each surviving candidate: spawn fresh Validator (different identity)
      → confirmed | needs_validation | rejected
-6. Spawn Reporter (deterministic) → write report from confirmed + needs_validation
-7. Set runs.status = complete (or incomplete + reason). Done.
+7. Spawn Reporter (deterministic) → write report from confirmed + needs_validation
+8. Set runs.status = complete (or incomplete + reason). Done.
 ```
 
-Crash at 4c? Reload from SQLite, re-claim unleased units, continue. **One task
+Crash at 5c? Reload from SQLite, re-claim unleased units, continue. **One task
 lost, not the run.**
 
 ---
@@ -312,6 +379,14 @@ Attack   : identity B → GET /api/orders/{A_id}   ⇒ should be 403/404
                                                    if 200 + A's data ⇒ FINDING
 Ground   : re-run all three w/ fresh tokens; confirm differential; cleanup
 ```
+**Judge against a permission table, not a status code.** An `HTTP 200` alone can't
+say access control worked — the object may be *intentionally* public, or a `403`
+may hide a successful state change. The pack derives a **permission table** from the
+target's documented rules (`identity × object × action → allowed/denied`) and
+confirms the finding by comparing **both the response and the actual resulting
+state** (via authoritative readback) against that table. A differential only counts
+when it contradicts a *documented* denial — which kills the most common
+false-positive class.
 
 **Command injection (shows the deterministic *blind* oracle — no browser/OOB needed):**
 ```
