@@ -54,8 +54,10 @@ CREATE TABLE IF NOT EXISTS coverage_units (
 );
 
 -- A candidate finding proposed by a Hunter, before/after grounding + validation.
+-- fingerprint = root-cause hash, stable ACROSS runs. Dedup is per run (the
+-- composite key), so a re-run still reports a known bug, flagged as known.
 CREATE TABLE IF NOT EXISTS candidates (
-    fingerprint        TEXT PRIMARY KEY,   -- dedup key (root-cause hash)
+    fingerprint        TEXT NOT NULL,
     run_id              TEXT NOT NULL REFERENCES runs(run_id),
     unit_id             TEXT NOT NULL REFERENCES coverage_units(id),
     title               TEXT NOT NULL,
@@ -64,7 +66,8 @@ CREATE TABLE IF NOT EXISTS candidates (
     status              TEXT NOT NULL DEFAULT 'proposed'
         CHECK (status IN ('proposed', 'grounded', 'validated', 'confirmed', 'needs_validation', 'rejected')),
     created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL
+    updated_at          TEXT NOT NULL,
+    PRIMARY KEY (run_id, fingerprint)
 );
 
 -- THE GROUNDING LEDGER. Every exact broker exchange, hashed. This is the
@@ -86,13 +89,15 @@ CREATE INDEX IF NOT EXISTS idx_ledger_run ON ledger(run_id);
 
 -- Final, reported findings. Severity only ever set once status = confirmed.
 CREATE TABLE IF NOT EXISTS findings (
-    fingerprint    TEXT PRIMARY KEY REFERENCES candidates(fingerprint),
+    fingerprint    TEXT NOT NULL,
     run_id         TEXT NOT NULL REFERENCES runs(run_id),
     verdict        TEXT NOT NULL
         CHECK (verdict IN ('confirmed', 'needs_validation', 'rejected')),
     severity       TEXT,                -- NULL unless verdict = confirmed
     evidence_refs  TEXT NOT NULL,        -- JSON list of ledger ids (minimized trace)
-    cleanup_done   INTEGER NOT NULL DEFAULT 0
+    cleanup_done   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, fingerprint),
+    FOREIGN KEY (run_id, fingerprint) REFERENCES candidates(run_id, fingerprint)
 );
 
 -- Dead-worker recovery. A lease that lapses is reclaimed, never assumed done.

@@ -31,13 +31,16 @@ IDENTITIES = [
 class FakeBroker:
     """Answers 200 to everything unless told otherwise per path."""
 
-    def __init__(self, identity_ok=True, status_for=None, flags_for=None):
+    def __init__(self, identity_ok=True, status_for=None, flags_for=None, raise_error=None):
         self.identity_ok = identity_ok
         self.status_for = status_for or {}
         self.flags_for = flags_for or {}
+        self.raise_error = raise_error      # e.g. ConnectionError("down"): simulate a network failure
         self.sent: list[RequestPlan] = []
 
     def send(self, plan: RequestPlan, contract: Contract) -> LedgerEntry:
+        if self.raise_error is not None:
+            raise self.raise_error
         self.sent.append(plan)
         n = len(self.sent)
         return LedgerEntry(
@@ -56,18 +59,23 @@ class FakeBroker:
 
 
 class FakeBrains:
-    def __init__(self, objects=None, validate_verdict="confirmed", plan_path=None):
+    def __init__(self, objects=None, validate_verdict="confirmed", plan_path=None, hunt_raises=None):
         self.objects = objects if objects is not None else [
             {"resource_type": "order", "endpoint": "/api/orders/1001", "method": "GET", "owner_identity": "user_A"},
         ]
         self.validate_verdict = validate_verdict
         self.plan_path = plan_path
+        self.hunt_raises = hunt_raises      # raised on the first hunt() call only
+        self.hunts = 0
         self.validated: list[dict] = []
 
     def surface_map(self, contract):
         return self.objects
 
     def hunt(self, unit, contract):
+        self.hunts += 1
+        if self.hunt_raises is not None and self.hunts == 1:
+            raise self.hunt_raises
         return [RequestPlan(
             unit_id=unit["unit_id"], identity=unit["identity"], method=unit["method"],
             path=self.plan_path or unit["endpoint"], pack="idor-bola", expect="403/404",

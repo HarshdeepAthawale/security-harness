@@ -15,7 +15,7 @@ incomplete).
 from __future__ import annotations
 
 from fnmatch import fnmatch
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from kernel.hooks import HookRegistry, HookVeto, StopCondition
 
@@ -41,13 +41,47 @@ def check_contract(ctx: dict) -> None:
         raise StopCondition(f"target {contract.target!r} is not in allowed_origins")
 
 
+MAX_DECODE_ROUNDS = 5
+
+
+def canonical_path(path: str) -> str:
+    """Decode a plan path the way a server might, and refuse anything that
+    could resolve somewhere other than where it looks like it goes.
+
+    Without this, "/api/../admin" or "/api/%2e%2e/admin" matches "/api/*"
+    but the server serves /admin. Raises HookVeto on any such path.
+    """
+    raw = path.split("#", 1)[0].split("?", 1)[0]
+    decoded = raw
+    for _ in range(MAX_DECODE_ROUNDS):
+        once_more = unquote(decoded)
+        if once_more == decoded:
+            break
+        decoded = once_more
+    else:
+        raise HookVeto(f"path {path!r} is percent-encoded too many times")
+
+    if not decoded.startswith("/"):
+        raise HookVeto(f"path {path!r} must be relative to the target (start with '/')")
+    if "\\" in decoded or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in decoded):
+        raise HookVeto(f"path {path!r} contains a backslash or control character")
+
+    segments = decoded.split("/")[1:]
+    for i, segment in enumerate(segments):
+        name = segment.split(";", 1)[0]          # "..;" is ".." to Tomcat and friends
+        if name in (".", ".."):
+            raise HookVeto(f"path {path!r} contains a dot segment")
+        if segment == "" and i != len(segments) - 1:
+            raise HookVeto(f"path {path!r} contains an empty segment (//)")
+    return decoded
+
+
 def enforce_scope(ctx: dict) -> None:
     plan, contract = ctx["plan"], ctx["contract"]
     if plan.method.upper() not in {m.upper() for m in contract.allowed_methods}:
         raise HookVeto(f"method {plan.method} is out of scope")
-    if not plan.path.startswith("/"):
-        raise HookVeto(f"path {plan.path!r} must be relative to the target (start with '/')")
-    if not any(fnmatch(plan.path, pattern) for pattern in contract.allowed_paths):
+    path = canonical_path(plan.path)
+    if not any(fnmatch(path, pattern) for pattern in contract.allowed_paths):
         raise HookVeto(f"path {plan.path} is out of scope")
     if plan.identity not in contract.identities:
         raise HookVeto(f"identity {plan.identity!r} is not permitted this run")

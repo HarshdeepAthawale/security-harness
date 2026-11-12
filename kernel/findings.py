@@ -4,6 +4,10 @@ Candidates, findings, and fingerprint dedup (PROJECT.md §6.1 job 6).
 One root cause = one fingerprint. Two hunters that hit /api/orders/1001 and
 /api/orders/2002 with the same pack, method and identity role found the
 same bug, so they share a fingerprint and only the first is kept.
+
+Dedup is per run: the fingerprint is stable across runs, but each run keeps
+its own candidate. A re-run that finds a known bug still reports it, with
+`previously_confirmed_in` pointing at the run that confirmed it first.
 """
 from __future__ import annotations
 
@@ -42,9 +46,11 @@ def record_candidate(
     trace: dict,
     proposed_verdict: str | None = None,
 ) -> bool:
-    """Insert a candidate. Returns False if this fingerprint already exists
-    (a duplicate of a root cause we already have), True if it's new."""
-    exists = conn.execute("SELECT 1 FROM candidates WHERE fingerprint = ?", (fingerprint,)).fetchone()
+    """Insert a candidate. Returns False if this run already has this
+    fingerprint (a duplicate of a root cause we already have), True if new."""
+    exists = conn.execute(
+        "SELECT 1 FROM candidates WHERE run_id = ? AND fingerprint = ?", (run_id, fingerprint)
+    ).fetchone()
     if exists:
         return False
     ts = now_iso()
@@ -56,10 +62,10 @@ def record_candidate(
     return True
 
 
-def set_candidate_status(conn: sqlite3.Connection, fingerprint: str, status: str) -> None:
+def set_candidate_status(conn: sqlite3.Connection, run_id: str, fingerprint: str, status: str) -> None:
     conn.execute(
-        "UPDATE candidates SET status = ?, updated_at = ? WHERE fingerprint = ?",
-        (status, now_iso(), fingerprint),
+        "UPDATE candidates SET status = ?, updated_at = ? WHERE run_id = ? AND fingerprint = ?",
+        (status, now_iso(), run_id, fingerprint),
     )
 
 
@@ -83,15 +89,19 @@ def write_finding(
         "VALUES (?, ?, ?, ?, ?, ?)",
         (fingerprint, run_id, verdict, severity, json.dumps(evidence_refs), int(cleanup_done)),
     )
-    set_candidate_status(conn, fingerprint, verdict)
+    set_candidate_status(conn, run_id, fingerprint, verdict)
 
 
 def reportable_findings(conn: sqlite3.Connection, run_id: str) -> list[dict]:
-    """Confirmed + needs_validation findings, joined with their candidate title."""
+    """Confirmed + needs_validation findings for this run, each flagged with
+    the earliest other run that already confirmed the same root cause."""
     rows = conn.execute(
         """
-        SELECT f.fingerprint, f.verdict, f.severity, f.evidence_refs, f.cleanup_done, c.title, c.trace_json
-        FROM findings f JOIN candidates c ON c.fingerprint = f.fingerprint
+        SELECT f.fingerprint, f.verdict, f.severity, f.evidence_refs, f.cleanup_done, c.title, c.trace_json,
+               (SELECT f2.run_id FROM findings f2 JOIN runs r2 ON r2.run_id = f2.run_id
+                WHERE f2.fingerprint = f.fingerprint AND f2.run_id != f.run_id AND f2.verdict = 'confirmed'
+                ORDER BY r2.started_at, r2.rowid LIMIT 1) AS previously_confirmed_in
+        FROM findings f JOIN candidates c ON c.run_id = f.run_id AND c.fingerprint = f.fingerprint
         WHERE f.run_id = ? AND f.verdict IN ('confirmed', 'needs_validation')
         ORDER BY f.verdict, c.title
         """,
@@ -105,6 +115,7 @@ def reportable_findings(conn: sqlite3.Connection, run_id: str) -> list[dict]:
             "title": r["title"],
             "evidence_refs": json.loads(r["evidence_refs"]),
             "cleanup_done": bool(r["cleanup_done"]),
+            "previously_confirmed_in": r["previously_confirmed_in"],
             "trace": json.loads(r["trace_json"]),
         }
         for r in rows

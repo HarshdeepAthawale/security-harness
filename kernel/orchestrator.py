@@ -6,6 +6,10 @@ contract + budget, fires hooks, decides when a run is done. NEVER calls an
 LLM. Broker / Judge / Brains are injected as plain protocols so this module
 has zero dependency on how those three workstreams are implemented —
 that's the whole point of freezing these contracts first.
+
+A run never ends silently: it finishes `complete`, or `incomplete` with the
+exact reason — including when Broker/Judge/Brains throw. An interrupted or
+incomplete run can be continued with `resume()`.
 """
 from __future__ import annotations
 
@@ -28,7 +32,10 @@ Replay = Callable[[RequestPlan], LedgerEntry]
 
 
 class Broker(Protocol):
-    def send(self, plan: RequestPlan, contract: Contract) -> LedgerEntry: ...
+    def send(self, plan: RequestPlan, contract: Contract) -> LedgerEntry:
+        """Send plan.path EXACTLY as given (it was validated in that form) —
+        don't re-decode or normalize it."""
+        ...
 
     def check_identity(self, contract: Contract) -> bool:
         """Target-identity readiness gate (PROJECT.md §7.1). True = this is
@@ -71,6 +78,26 @@ class RunIncomplete(Exception):
     def __init__(self, reason: str):
         self.reason = reason
         super().__init__(reason)
+
+
+class ComponentError(Exception):
+    """Broker, Judge or Brains raised. Ends the run as incomplete, naming who."""
+
+    def __init__(self, component: str, error: Exception):
+        self.component = component
+        self.error = error
+        super().__init__(f"{component} failed: {type(error).__name__}: {error}")
+
+
+def _call(component: str, fn, *args, **kwargs):
+    """Call into another workstream. Hook vetoes pass through untouched (they
+    are rules, not failures); anything else is wrapped as ComponentError."""
+    try:
+        return fn(*args, **kwargs)
+    except (HookVeto, RunIncomplete, ComponentError):
+        raise
+    except Exception as error:
+        raise ComponentError(component, error) from error
 
 
 @dataclass
@@ -125,6 +152,13 @@ class Orchestrator:
             (status, reason, now_iso(), run_id),
         )
         return status, reason
+
+    def _run_exists(self, run_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is not None
+
+    def _save_budget(self, run_id: str, budget: Budget) -> None:
+        """Budget is persisted as it is spent, so resume() knows what's left."""
+        self.conn.execute("UPDATE runs SET budget_json = ? WHERE run_id = ?", (json.dumps(budget.__dict__), run_id))
 
     # -- seeding -----------------------------------------------------------
 
@@ -186,7 +220,7 @@ class Orchestrator:
         """Send one request plan through the broker, with hook enforcement
         on both sides. This is the ONLY path a plan takes to the network."""
         self.hooks.fire("pre_broker_request", {"plan": plan, "contract": contract})
-        entry = broker.send(plan, contract)
+        entry = _call("broker", broker.send, plan, contract)
         self._write_ledger_entry(entry)
         self.hooks.fire("post_broker_request", {"entry": entry, "contract": contract})
         return entry
@@ -208,7 +242,7 @@ class Orchestrator:
         trace = json.loads(trace_json)
         request_hashes = trace.get("request_hashes", [])
         if not request_hashes:
-            findings.set_candidate_status(self.conn, fingerprint, "rejected")
+            findings.set_candidate_status(self.conn, run_id, fingerprint, "rejected")
             return False
         rows = self.conn.execute(
             f"SELECT request_hash FROM ledger WHERE run_id = ? AND request_hash IN "
@@ -217,16 +251,16 @@ class Orchestrator:
         ).fetchall()
         matched = {r["request_hash"] for r in rows}
         if not set(request_hashes).issubset(matched):
-            findings.set_candidate_status(self.conn, fingerprint, "rejected")
+            findings.set_candidate_status(self.conn, run_id, fingerprint, "rejected")
             return False
 
         try:
             self.hooks.fire("pre_candidate_accept", {"fingerprint": fingerprint, "run_id": run_id, "trace": trace})
         except HookVeto:
-            findings.set_candidate_status(self.conn, fingerprint, "rejected")
+            findings.set_candidate_status(self.conn, run_id, fingerprint, "rejected")
             return False
 
-        findings.set_candidate_status(self.conn, fingerprint, "grounded")
+        findings.set_candidate_status(self.conn, run_id, fingerprint, "grounded")
         return True
 
     # -- validator assignment (Hunter != Validator invariant) ----------------
@@ -266,60 +300,141 @@ class Orchestrator:
         batch_size: int = 10,
         min_validator_reserve: int = 1,
     ) -> RunResult:
+        """Start a NEW run. To continue an existing one, use resume()."""
         run_id = contract.run_id
-        try:
+        if self._run_exists(run_id):
+            # Never touch an existing run from here — that's resume()'s job.
+            return RunResult(run_id, "incomplete", f"run {run_id!r} already exists; use resume() to continue it")
+
+        def body() -> RunResult:
             # 1. load + verify contract, write run row (session_start hooks)
             try:
                 self.start_run(contract, budget, profile, identities)
             except HookVeto as veto:
                 raise RunIncomplete(veto.reason)
-
-            # 2. readiness gate: are we talking to the intended app?
-            if not broker.check_identity(contract):
-                raise RunIncomplete("target identity check failed: not the intended application")
-
+            # 2. readiness gate
+            self._readiness_gate(contract, broker)
             # 3. recon -> objects + coverage units
-            units_created = self.seed_from_recon(run_id, brains.surface_map(contract))
-            if units_created == 0:
+            objects = _call("brains", brains.surface_map, contract)
+            if self.seed_from_recon(run_id, objects) == 0:
                 raise RunIncomplete("recon produced no coverage units")
+            # 4. budget gate
+            self._budget_gate(budget, min_validator_reserve)
+            # 5–8. hunt, validate, report, terminal decision
+            return self._hunt_validate_report(contract, budget, broker, judge, brains, batch_size)
 
-            # 4. budget gate: validation must be fundable before any hunting
-            if budget.max_validator_calls - budget.used_validator_calls < min_validator_reserve:
-                raise RunIncomplete(
-                    f"budget cannot fund the minimum validator reserve ({min_validator_reserve})"
-                )
+        return self._guarded(run_id, body)
 
-            # 5. hunt -> dispatch -> judge -> ground, until units or budget run out
-            hunter_budget_out = self._hunt_loop(run_id, contract, budget, broker, judge, brains, batch_size)
+    def resume(
+        self,
+        contract: Contract,
+        broker: Broker,
+        judge: Judge,
+        brains: Brains,
+        *,
+        add_hunter_calls: int = 0,
+        add_validator_calls: int = 0,
+        batch_size: int = 10,
+        min_validator_reserve: int = 1,
+    ) -> RunResult:
+        """Continue a run that crashed (still 'in_progress') or stopped
+        ('incomplete'). Picks up from the saved state: interrupted units are
+        re-queued, deferred units are retried, grounded candidates are still
+        validated. Budget comes from the DB; add_* tops it up."""
+        run_id = contract.run_id
+        row = self.conn.execute("SELECT status, contract_hash, budget_json FROM runs WHERE run_id = ?",
+                                (run_id,)).fetchone()
+        if row is None:
+            return RunResult(run_id, "incomplete", f"no run {run_id!r} to resume")
+        if row["status"] == "complete":
+            return RunResult(run_id, "complete", "run already complete; nothing to resume",
+                             findings=findings.reportable_findings(self.conn, run_id))
+        if row["contract_hash"] != contract.contract_hash:
+            return RunResult(run_id, row["status"], "contract differs from the original run; a changed scope is a new run")
 
-            # 6. independent validation of every grounded candidate
-            self._validate_all(run_id, budget, brains)
+        budget = Budget(**json.loads(row["budget_json"]))
+        budget.max_hunter_calls += add_hunter_calls
+        budget.max_validator_calls += add_validator_calls
 
-            # 7. report (confirmed + needs_validation only)
-            reportable = findings.reportable_findings(self.conn, run_id)
-            report = brains.report(reportable)
+        def body() -> RunResult:
+            self.conn.execute("UPDATE runs SET status = 'in_progress', reason = NULL, ended_at = NULL WHERE run_id = ?",
+                              (run_id,))
+            try:
+                self.hooks.fire("session_start", {"contract": contract, "conn": self.conn})
+            except HookVeto as veto:
+                raise RunIncomplete(veto.reason)
+            self._recover_interrupted(run_id)
+            self._save_budget(run_id, budget)
+            self._readiness_gate(contract, broker)
+            self._budget_gate(budget, min_validator_reserve)
+            return self._hunt_validate_report(contract, budget, broker, judge, brains, batch_size)
 
-            # 8. terminal decision
-            if hunter_budget_out:
-                left = self.conn.execute(
-                    "SELECT COUNT(*) AS n FROM coverage_units WHERE run_id = ? AND state = 'deferred'",
-                    (run_id,),
-                ).fetchone()["n"]
-                status, reason = self.finish_run(run_id, "incomplete", f"hunter budget exhausted; {left} unit(s) deferred")
-            else:
-                status, reason = self.finish_run(run_id, "complete")
-            return RunResult(run_id, status, reason, report, reportable)
+        return self._guarded(run_id, body)
 
+    def _guarded(self, run_id: str, body: Callable[[], RunResult]) -> RunResult:
+        """Run body; whatever goes wrong, end the run as incomplete with the
+        exact reason, and free its leases so resume() can pick it up."""
+        try:
+            return body()
         except RunIncomplete as stop:
-            exists = self.conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
-            if exists:
-                status, reason = self.finish_run(run_id, "incomplete", stop.reason)
-            else:
-                status, reason = "incomplete", stop.reason
-            return RunResult(run_id, status, reason, None, findings.reportable_findings(self.conn, run_id))
+            reason = stop.reason
+        except ComponentError as error:
+            reason = str(error)
+        except HookVeto as veto:
+            reason = f"unexpected veto: {veto.reason}"
+        except Exception as error:  # a kernel bug: still never leave a run hanging
+            reason = f"kernel error: {type(error).__name__}: {error}"
+
+        if not self._run_exists(run_id):
+            return RunResult(run_id, "incomplete", reason)
+        leases.release_all(self.conn, run_id)
+        status, reason = self.finish_run(run_id, "incomplete", reason)
+        return RunResult(run_id, status, reason, None, findings.reportable_findings(self.conn, run_id))
+
+    def _readiness_gate(self, contract: Contract, broker: Broker) -> None:
+        if not _call("broker", broker.check_identity, contract):
+            raise RunIncomplete("target identity check failed: not the intended application")
+
+    @staticmethod
+    def _budget_gate(budget: Budget, min_validator_reserve: int) -> None:
+        if budget.max_validator_calls - budget.used_validator_calls < min_validator_reserve:
+            raise RunIncomplete(f"budget cannot fund the minimum validator reserve ({min_validator_reserve})")
+
+    def _recover_interrupted(self, run_id: str) -> None:
+        """Clean up what a crash or stop left behind, before continuing."""
+        leases.release_all(self.conn, run_id)                     # dead workers' units -> planned
+        self.conn.execute("UPDATE coverage_units SET state = 'planned' WHERE run_id = ? AND state = 'deferred'",
+                          (run_id,))                                # retry what budget skipped
+        self.conn.execute("DELETE FROM candidates WHERE run_id = ? AND status = 'proposed'",
+                          (run_id,))                                # half-accepted: its unit is re-hunted
+        interrupted = self.conn.execute("SELECT id FROM threads WHERE run_id = ? AND status = 'open'",
+                                        (run_id,)).fetchall()
+        for t in interrupted:
+            state.add_rejected_path(self.conn, t["id"], "interrupted before a verdict; unit re-queued")
+            state.update_thread(self.conn, t["id"], status="rejected")
+
+    def _hunt_validate_report(self, contract, budget, broker, judge, brains, batch_size) -> RunResult:
+        run_id = contract.run_id
+        # 5. hunt -> dispatch -> judge -> ground
+        hunter_budget_out = self._hunt_loop(run_id, contract, budget, broker, judge, brains, batch_size)
+        # 6. independent validation of every grounded candidate
+        self._validate_all(run_id, budget, brains)
+        # 7. report (confirmed + needs_validation only)
+        reportable = findings.reportable_findings(self.conn, run_id)
+        report = _call("brains", brains.report, reportable)
+        # 8. terminal decision
+        if hunter_budget_out:
+            left = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM coverage_units WHERE run_id = ? AND state = 'deferred'", (run_id,)
+            ).fetchone()["n"]
+            status, reason = self.finish_run(run_id, "incomplete", f"hunter budget exhausted; {left} unit(s) deferred")
+        else:
+            status, reason = self.finish_run(run_id, "complete")
+        return RunResult(run_id, status, reason, report, reportable)
 
     def _hunt_loop(self, run_id, contract, budget, broker, judge, brains, batch_size) -> bool:
-        """Returns True if the hunter budget ran out with units still planned."""
+        """Returns True if the hunter budget ran out with units still planned.
+        A stop condition or component error propagates; _guarded frees leases."""
         budget_out = False
         while True:
             self.reap_expired_leases(run_id)
@@ -338,18 +453,21 @@ class Orchestrator:
                     self.release_unit(unit_id, agent_id, "deferred")
                     budget_out = True
                     continue
+                self._save_budget(run_id, budget)
                 try:
                     new_state = self._hunt_unit(run_id, unit_id, agent_id, contract, broker, judge, brains)
                 except StopCondition as stop:
-                    self.release_unit(unit_id, agent_id, "blocked")
                     raise RunIncomplete(stop.reason)
                 self.release_unit(unit_id, agent_id, new_state)
 
     def _hunt_unit(self, run_id, unit_id, agent_id, contract, broker, judge, brains) -> str:
         unit = self._unit_view(unit_id)
-        plans = brains.hunt(unit, contract)
+        plans = _call("brains", brains.hunt, unit, contract)
         if not plans:
             return "covered"
+        for plan in plans:
+            if not isinstance(plan, RequestPlan):
+                raise ComponentError("brains", TypeError(f"hunt() returned {type(plan).__name__}, not RequestPlan"))
 
         entries: list[LedgerEntry] = []
         sent: list[RequestPlan] = []
@@ -392,7 +510,7 @@ class Orchestrator:
             state.link_evidence(self.conn, thread_id, entry.id)
         trace["thread_id"] = thread_id
 
-        verdict = judge.evaluate(trace)
+        verdict = _call("judge", judge.evaluate, trace)
         if verdict == "rejected":
             state.update_thread(self.conn, thread_id, status="rejected")
             state.add_rejected_path(self.conn, thread_id, f"{pack} on {unit['method']} {unit['endpoint']}: no differential")
@@ -412,17 +530,24 @@ class Orchestrator:
             return "covered"
 
         replay: Replay = lambda plan: self.dispatch(plan, contract, broker)
-        if not judge.ground(trace, run_id, replay):
-            findings.set_candidate_status(self.conn, fingerprint, "rejected")
+        try:
+            reproduced = _call("judge", judge.ground, trace, run_id, replay)
+            not_reproduced_note = "did not reproduce on replay"
+        except StopCondition:
+            raise
+        except HookVeto as veto:
+            reproduced, not_reproduced_note = False, f"replay blocked: {veto.reason}"
+        if not reproduced:
+            findings.set_candidate_status(self.conn, run_id, fingerprint, "rejected")
             state.update_thread(self.conn, thread_id, status="rejected")
-            state.add_rejected_path(self.conn, thread_id, "did not reproduce on replay")
+            state.add_rejected_path(self.conn, thread_id, not_reproduced_note)
             return "covered"
 
         # The judge may annotate the trace during ground() (cleanup_done,
         # severity_hint, minimized ledger_ids) — persist what it wrote.
         self.conn.execute(
-            "UPDATE candidates SET trace_json = ?, updated_at = ? WHERE fingerprint = ?",
-            (json.dumps(trace), now_iso(), fingerprint),
+            "UPDATE candidates SET trace_json = ?, updated_at = ? WHERE run_id = ? AND fingerprint = ?",
+            (json.dumps(trace), now_iso(), run_id, fingerprint),
         )
         state.update_thread(self.conn, thread_id, status="holding", next_step="independent validation")
         return "candidate"
@@ -440,8 +565,9 @@ class Orchestrator:
             if not budget.reserve_validator(1):
                 final = "needs_validation"   # no budget left for a second opinion
             else:
+                self._save_budget(run_id, budget)
                 self.assign_validator(trace["hunter"], f"validator-{fingerprint}")
-                validator_verdict = brains.validate(trace)
+                validator_verdict = _call("brains", brains.validate, trace)
                 if "rejected" in (judge_verdict, validator_verdict):
                     final = "rejected"
                 elif judge_verdict == validator_verdict == "confirmed":

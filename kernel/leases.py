@@ -39,6 +39,19 @@ def release(conn: sqlite3.Connection, unit_id: str, agent_id: str, new_state: st
     conn.execute("UPDATE coverage_units SET state = ?, owner_agent = NULL WHERE id = ?", (new_state, unit_id))
 
 
+def release_all(conn: sqlite3.Connection, run_id: str) -> int:
+    """Drop every lease in a run and put its in-flight units back to
+    'planned'. Used when a run stops or crashes: those workers are gone."""
+    conn.execute(
+        "DELETE FROM leases WHERE unit_id IN (SELECT id FROM coverage_units WHERE run_id = ?)", (run_id,)
+    )
+    cur = conn.execute(
+        "UPDATE coverage_units SET state = 'planned', owner_agent = NULL WHERE run_id = ? AND state = 'in_progress'",
+        (run_id,),
+    )
+    return cur.rowcount
+
+
 def reap_expired(conn: sqlite3.Connection, run_id: str) -> list[str]:
     """Reclaim any lapsed leases for this run. Returns the unit_ids recovered."""
     now = time.time()

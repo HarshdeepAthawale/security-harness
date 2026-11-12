@@ -89,6 +89,11 @@ kernel drives it.
 **Broker**
 - `send()` returns a `LedgerEntry`. The kernel writes it to the ledger;
   you don't touch the DB.
+- Send `plan.path` **exactly as given**. The kernel validated it in that
+  form (dot segments, `//`, encoded slashes, backslashes are rejected).
+  Don't re-decode or normalize it, or the scope check no longer holds.
+- If `send()` raises (network down, timeout), the run ends `incomplete`
+  with your error in the reason and can be resumed. Don't swallow errors.
 - Resolve `plan.identity` (a label like `"user_B"`) to a real secret using
   the identity's `cred_ref`. That's the only place a real token ever exists.
 - Set `LedgerEntry.flags` when you detect `bot_challenge`,
@@ -148,12 +153,32 @@ print(result.status, result.reason, result.report)
 budget gate → hunt/dispatch/judge/ground loop → independent validation →
 report → `complete` / `incomplete` with the exact reason.
 
+**A run never hangs.** If Broker, Judge or Brains raises, the run ends
+`incomplete` with a reason like `broker failed: ConnectionError: ...`,
+and its leases are freed.
+
+**Resuming.** A run that stopped (`incomplete`) or crashed (left
+`in_progress`) continues with:
+
+```python
+result = orch.resume(contract, broker, judge, brains, add_hunter_calls=50)
+```
+
+It re-queues interrupted units, retries units the budget skipped, keeps
+everything already grounded or confirmed, and loads the spent budget from
+the DB (`add_*` tops it up). It refuses a changed contract, because a
+different scope is a new run.
+
+**Known bugs in re-runs.** A fingerprint is stable across runs, so a
+later run still reports a bug found before, with
+`previously_confirmed_in` set to the earlier run's id.
+
 ## Default hooks (`kernel/default_hooks.py`)
 
 | Hook | Rule |
 |---|---|
 | `session_start` | contract hash must match (scope not edited after signing); target must be in `allowed_origins` |
-| `pre_broker_request` | method, relative path (glob) and identity must be in the contract |
+| `pre_broker_request` | method, path and identity must be in the contract. The path is decoded first; `..`, `.`, `//`, `%2f`, `..;`, backslashes and control characters are refused |
 | `post_broker_request` | `429` or a broker flag (`bot_challenge`, `auth_ambiguity`, `destructive_effect`, plus any listed in the contract) stops the run |
 | `session_end` | every confirmed finding needs verified cleanup, otherwise the run is `incomplete` |
 
@@ -170,4 +195,8 @@ pytest
   the fakes in `tests/fakes.py` only.
 - Parallel hunters. `run()` hunts units one at a time; leases are in place
   so it can fan out later.
+- Per-unit database transactions. A crash mid-unit can leave partial
+  rows; `resume()` cleans those up, but writes aren't atomic.
+- Hunter ≠ validator is enforced on agent ids only. Using a different
+  model/context for validation is up to Brains.
 - A CLI / config file for starting a run.
