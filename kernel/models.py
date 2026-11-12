@@ -13,6 +13,8 @@ Rules baked into the shape itself:
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -62,6 +64,9 @@ class LedgerEntry:
     identity_id: str | None
     id: str = field(default_factory=lambda: new_id("ledg"))
     ts: str = field(default_factory=now_iso)
+    # Signals the broker detected on the response, e.g. "bot_challenge",
+    # "auth_ambiguity", "destructive_effect". Any of these stops the run.
+    flags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -110,3 +115,19 @@ class Contract:
     identities: list[str]          # identity labels permitted this run
     stop_conditions: list[str]     # e.g. "bot_challenge", "rate_limit"
     contract_hash: str
+
+    def compute_hash(self) -> str:
+        """Hash of every scope field. session_start refuses a contract whose
+        stored contract_hash doesn't match (i.e. it was edited after signing)."""
+        payload = json.dumps(
+            {
+                "target": self.target,
+                "allowed_origins": sorted(self.allowed_origins),
+                "allowed_paths": sorted(self.allowed_paths),
+                "allowed_methods": sorted(m.upper() for m in self.allowed_methods),
+                "identities": sorted(self.identities),
+                "stop_conditions": sorted(self.stop_conditions),
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()

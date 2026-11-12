@@ -49,6 +49,11 @@ class HookVeto(Exception):
         super().__init__(reason)
 
 
+class StopCondition(HookVeto):
+    """A veto that halts the whole run (rate limit, bot challenge,
+    destructive effect...), not just the single event."""
+
+
 class HookRegistry:
     def __init__(self) -> None:
         self._hooks: dict[str, list[HookFn]] = defaultdict(list)
