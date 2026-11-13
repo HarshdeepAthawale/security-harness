@@ -53,9 +53,13 @@ class Judge(Protocol):
         """Re-execute the claimed sequence and return True if it reproduces.
         Replays MUST go through `replay(plan)` — it routes through the kernel
         and broker, so replays are scope-checked and logged like any request.
-        The judge may write these keys into candidate_trace and the kernel
-        saves them: cleanup_done (bool), severity_hint (str), and ledger_ids
-        (the minimized reproducing exchanges)."""
+
+        candidate_trace is the judge's own copy. Changes to it are ignored,
+        except these three, which the kernel checks and keeps:
+          cleanup_done (bool), severity_hint (str),
+          ledger_ids (non-empty list; every id must be one of this
+          candidate's recorded exchanges or a replay made through `replay`).
+        Citing any other id rejects the candidate."""
         ...
 
 
@@ -529,28 +533,67 @@ class Orchestrator:
             state.update_thread(self.conn, thread_id, status="rejected")
             return "covered"
 
-        replay: Replay = lambda plan: self.dispatch(plan, contract, broker)
+        replayed: list[LedgerEntry] = []
+
+        def replay(plan: RequestPlan) -> LedgerEntry:
+            entry = self.dispatch(plan, contract, broker)
+            replayed.append(entry)
+            return entry
+
+        # The judge works on a COPY: it can't rewrite the kernel's record of
+        # what happened (plans, status codes, response digests). Only the
+        # annotations in JUDGE_FIELDS come back, and they are checked.
+        judge_view = json.loads(json.dumps(trace))
         try:
-            reproduced = _call("judge", judge.ground, trace, run_id, replay)
+            reproduced = _call("judge", judge.ground, judge_view, run_id, replay)
             not_reproduced_note = "did not reproduce on replay"
         except StopCondition:
             raise
         except HookVeto as veto:
             reproduced, not_reproduced_note = False, f"replay blocked: {veto.reason}"
+        for entry in replayed:
+            state.link_evidence(self.conn, thread_id, entry.id, note="replay")
+
+        if reproduced:
+            allowed_ids = set(trace["ledger_ids"]) | {e.id for e in replayed}
+            problem = self._take_judge_annotations(trace, judge_view, allowed_ids)
+            if problem:
+                reproduced, not_reproduced_note = False, problem
         if not reproduced:
             findings.set_candidate_status(self.conn, run_id, fingerprint, "rejected")
             state.update_thread(self.conn, thread_id, status="rejected")
             state.add_rejected_path(self.conn, thread_id, not_reproduced_note)
             return "covered"
 
-        # The judge may annotate the trace during ground() (cleanup_done,
-        # severity_hint, minimized ledger_ids) — persist what it wrote.
         self.conn.execute(
             "UPDATE candidates SET trace_json = ?, updated_at = ? WHERE run_id = ? AND fingerprint = ?",
             (json.dumps(trace), now_iso(), run_id, fingerprint),
         )
         state.update_thread(self.conn, thread_id, status="holding", next_step="independent validation")
         return "candidate"
+
+    @staticmethod
+    def _take_judge_annotations(trace: dict, judge_view: dict, allowed_ids: set[str]) -> str | None:
+        """Copy the judge's annotations onto the kernel's trace, checking each.
+        Returns a reason string if the judge's claims don't hold up."""
+        if "cleanup_done" in judge_view:
+            if not isinstance(judge_view["cleanup_done"], bool):
+                return "judge set cleanup_done to a non-boolean"
+            trace["cleanup_done"] = judge_view["cleanup_done"]
+        if "severity_hint" in judge_view:
+            if judge_view["severity_hint"] is not None and not isinstance(judge_view["severity_hint"], str):
+                return "judge set severity_hint to a non-string"
+            trace["severity_hint"] = judge_view["severity_hint"]
+        if "ledger_ids" in judge_view:
+            ids = judge_view["ledger_ids"]
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+                return "judge returned no usable evidence (ledger_ids must be a non-empty list)"
+            unknown = [i for i in ids if i not in allowed_ids]
+            if unknown:
+                return (f"judge cited {len(unknown)} exchange(s) that were never recorded for this "
+                        f"candidate: {', '.join(unknown[:3])}")
+            trace["ledger_ids"] = ids
+        return None
 
     def _validate_all(self, run_id: str, budget: Budget, brains: Brains) -> None:
         rows = self.conn.execute(
