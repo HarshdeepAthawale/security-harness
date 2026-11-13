@@ -12,6 +12,40 @@ as unverified. Only the judge can return a reproduced verdict.
 5. The judge replays broker evidence and returns a JudgeResult.
 6. report.py puts reproduced results in findings and others in an Unverified / not reproduced section.
 
+## Plugging into the kernel: `brains/adapter.py`
+
+The kernel calls Brains through the `Brains` protocol in
+`kernel/orchestrator.py`. `IdorBrains` implements it on top of the modules
+below, without changing them:
+
+| Kernel calls | IdorBrains does |
+|---|---|
+| `surface_map(contract)` | `recon.build_recon_map` + one LLM call for hypotheses, then fills each endpoint template with a real object id per owner |
+| `hunt(unit, contract)` | two `RequestPlan`s: **baseline** (owner reads own object) and **attack** (other identity reads it). Owner-on-own-object units get no plans. |
+| `validate(trace)` | deterministic, no LLM: attacker got the owner's exact body → `confirmed`; 401/403/404 → `rejected`; anything else → `needs_validation` |
+| `report(findings)` | turns kernel findings into `JudgeResult`s and uses `report.build_report` |
+
+```python
+from brains.adapter import IdorBrains
+
+brains = IdorBrains(
+    raw_endpoints=[{"method": "GET", "path": "/api/orders/{id}", "auth_required": True}],
+    object_ids={"orders": {"user_A": "1001", "user_B": "2002"}},   # which object each user owns
+)
+result = orch.run(contract, budget, broker, judge, brains, identities=[...])
+```
+
+Rules it keeps:
+- The LLM only proposes. It adds the rationale; it can't hide an endpoint,
+  because every endpoint with an object id is tested whatever the model says.
+- Each plan's `expect` starts with `baseline:` or `attack:`; the judge can
+  read the role with `brains.adapter.plan_role(plan)`.
+- Object ids are URL-encoded into the path, so an id can't add path segments.
+- `use_llm=False` runs with no model at all.
+
+Limits: paths with more than one id (e.g. `/users/{uid}/orders/{oid}`) are
+skipped for now, and `object_ids` must be supplied by whoever sets up the run.
+
 ## What each file does
 
 - brains/schemas.py: Python dataclasses shared across stages.
