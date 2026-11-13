@@ -5,4 +5,4 @@ description = "An open, local-first agentic harness that hunts web vulnerabiliti
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "brains/tests"]
