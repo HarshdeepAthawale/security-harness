@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {"$ref": "#/$defs/Endpoint"},
+    {"$ref": "#/$defs/Hypothesis"},
+    {"$ref": "#/$defs/JudgeResult"}
+  ],
+  "$defs": {
+    "Endpoint": {
+      "type": "object",
+      "required": ["method", "path", "path_params", "auth_required"],
+      "properties": {
+        "method": {"type": "string", "examples": ["GET"]},
+        "path": {"type": "string", "examples": ["/api/orders/{id}"]},
+        "path_params": {"type": "array", "items": {"type": "string"}},
+        "auth_required": {"type": "boolean"}
+      }
+    },
+    "TestPlan": {
+      "type": "object",
+      "required": ["actor_a", "actor_b", "steps", "expected_if_vulnerable", "expected_if_safe"],
+      "properties": {
+        "actor_a": {"type": "string"},
+        "actor_b": {"type": "string"},
+        "steps": {"type": "array", "items": {"type": "string"}},
+        "expected_if_vulnerable": {"type": "string"},
+        "expected_if_safe": {"type": "string"}
+      }
+    },
+    "Hypothesis": {
+      "type": "object",
+      "required": ["id", "type", "endpoint", "rationale", "test_plan", "confidence", "status"],
+      "properties": {
+        "id": {"type": "string", "examples": ["hyp-0001"]},
+        "type": {"type": "string", "const": "IDOR"},
+        "endpoint": {"$ref": "#/$defs/Endpoint"},
+        "rationale": {"type": "string"},
+        "test_plan": {"$ref": "#/$defs/TestPlan"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "status": {"type": "string", "const": "unverified"}
+      }
+    },
+    "JudgeResult": {
+      "type": "object",
+      "required": ["hypothesis_id", "reproduced", "evidence", "notes"],
+      "properties": {
+        "hypothesis_id": {"type": "string"},
+        "reproduced": {"type": "boolean"},
+        "evidence": {"type": "object"},
+        "notes": {"type": "string"}
+      }
+    }
+  }
+}
