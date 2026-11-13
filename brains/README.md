@@ -54,9 +54,39 @@ skipped for now, and `object_ids` must be supplied by whoever sets up the run.
 - brains/hunt.py: hypothesis generation and endpoint anti-hallucination check.
 - brains/validate.py: replayable request template preparation without a verdict.
 - brains/report.py: report separated by judge result.
-- brains/llm_client.py: OpenRouter HTTP client using OPENROUTER_API_KEY with one JSON retry.
+- brains/llm_client.py: model client, OpenRouter (cloud) or Ollama (local), with one JSON retry.
+- brains/adapter.py: plugs the modules above into the kernel.
 - brains/prompts/: stage instructions and JSON examples.
-- brains/tests/test_hunt.py: fake-data tests with no API call.
+- brains/tests/: fake-data tests with no API call and no network.
+
+## Choosing the model: cloud or local
+
+Brains talks to a model through `brains/llm_client.py`. Pick one with
+`LLM_PROVIDER`:
+
+| `LLM_PROVIDER` | Where it runs | Needs |
+|---|---|---|
+| `openrouter` (default) | cloud | `OPENROUTER_API_KEY`; optional `OPENROUTER_MODEL` |
+| `ollama` | **this machine**: recon data never leaves it | Ollama running; optional `OLLAMA_URL`, `OLLAMA_MODEL` |
+
+Local setup:
+
+    ollama serve
+    ollama pull qwen2.5:7b
+    LLM_PROVIDER=ollama python your_run_script.py
+
+Or pick it in code:
+
+```python
+from brains.llm_client import make_llm_client
+brains = IdorBrains(raw_endpoints, object_ids, llm_client=make_llm_client("ollama", model="qwen2.5:7b"))
+```
+
+The Ollama client sends `format: "json"` and `temperature: 0`. It refuses an
+`OLLAMA_URL` that isn't on this machine unless `OLLAMA_ALLOW_REMOTE=1`, so a
+typo can't quietly send target data to another host. Smaller local models
+may give fewer or weaker hypotheses; that only affects the report's
+rationale, because the adapter tests every object endpoint anyway.
 
 ## Install and run tests
 
@@ -65,5 +95,6 @@ Use Python 3.10 or newer. From this project directory:
     python -m pip install -r requirements.txt
     python -m pytest brains/tests
 
-The tests need no API key. For a real model call, set OPENROUTER_API_KEY as
-shown in .env.example. Never treat a hypothesis or validation spec as a finding.
+The tests need no API key and no Ollama. For a real model call, set the
+variables shown in .env.example. Never treat a hypothesis or validation spec
+as a finding.
