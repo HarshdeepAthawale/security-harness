@@ -74,28 +74,49 @@ def check_json_serializable(value: Any) -> bytes:
         raise ValueError("Value must be valid JSON")
 
 
-def has_traversal(path: str) -> bool:
+def path_problem(path: str) -> str | None:
     """
-    Detect literal and repeatedly encoded traversal segments.
+    Why a path is unsafe to send, or None if it is fine.
+
+    Used by BOTH the plan model and the scope check, so the two can't
+    disagree. The path is decoded repeatedly and every layer is checked:
+
+      traversal         '..' and '.', including with a path parameter
+                        ('..;' means '..' to Tomcat/Spring)
+      empty segment     '//' inside the path (servers collapse it)
+      control character raw, or decoded from %00, %0d, %0a ...
+      backslash         read as '/' by some servers
+      too many layers   /%252e%252e/ style nesting
     """
 
     current = path
 
     for _ in range(6):
 
+        if "\\" in current:
+            return "backslash"
+
+        if any(ord(char) < 32 or ord(char) == 127 for char in current):
+            return "control character"
+
         segments = current.split("/")
 
-        if any(segment in {".", ".."} for segment in segments):
-            return True
+        for index, segment in enumerate(segments[1:], start=1):
+
+            if segment.split(";", 1)[0] in {".", ".."}:
+                return "dot segment"
+
+            if segment == "" and index != len(segments) - 1:
+                return "empty segment"
 
         decoded = unquote(current)
 
         if decoded == current:
-            break
+            return None
 
         current = decoded
 
-    return False
+    return "too many encoding layers"
 
 
 # --------------------------------------------------
@@ -186,8 +207,13 @@ class RequestPlan(BaseModel):
         if re.search(r"%(?:2f|5c)", value, re.IGNORECASE):
             raise ValueError("Encoded path separators are not allowed")
 
-        if has_traversal(value):
+        problem = path_problem(value)
+
+        if problem == "dot segment":
             raise ValueError("Path traversal detected")
+
+        if problem:
+            raise ValueError(f"Unsafe path: {problem}")
 
         return value
 
@@ -316,6 +342,20 @@ class RequestPlan(BaseModel):
 
         if len(serialized) > MAX_QUERY_SIZE:
             raise ValueError("Query parameters too large")
+
+        # A query string can only carry flat values. A nested object would be
+        # sent as its Python repr, which is never what the plan meant.
+        scalar = (str, int, float, bool, type(None))
+
+        for key, value in query.items():
+
+            if isinstance(value, scalar):
+                continue
+
+            if isinstance(value, list) and all(isinstance(v, scalar) for v in value):
+                continue
+
+            raise ValueError(f"Query parameter {key!r} must be a scalar or a list of scalars")
 
         return query
 

@@ -242,8 +242,8 @@ def test_rejects_invalid_paths(path):
     "proxy-authorization",
     "cookie",
 
-    # Destination control
-    "host",
+    # "host" is deliberately NOT here: the plan may carry one, and the scope
+    # check refuses it unless the policy enables a Host override (see test_scope.py).
 
     # HTTP message framing
     "content-length",

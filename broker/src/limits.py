@@ -9,5 +9,9 @@ CONNECT_TIMEOUT_SECONDS = 5.0
 READ_TIMEOUT_SECONDS = 20.0
 WRITE_TIMEOUT_SECONDS = 10.0
 POOL_TIMEOUT_SECONDS = 5.0
+# Hard ceiling for one whole request: connect, send, headers AND body. The
+# per-read timeout alone doesn't bound it: a server sending a byte every 19
+# seconds never trips a 20 second read timeout.
+TOTAL_TIMEOUT_SECONDS = 30.0
 MAX_LEDGER_RECORD_BYTES = 4 * 1024 * 1024
 MAX_BODY_SIZE = 1_000_000
