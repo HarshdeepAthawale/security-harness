@@ -87,6 +87,26 @@ CREATE TABLE IF NOT EXISTS ledger (
 CREATE INDEX IF NOT EXISTS idx_ledger_request_hash ON ledger(request_hash);
 CREATE INDEX IF NOT EXISTS idx_ledger_run ON ledger(run_id);
 
+-- DISPATCH LOG: every request the kernel was asked to send, written BEFORE
+-- the broker is called. If the broker crashes or times out mid-request, the
+-- attempt is still on record. The ledger says what came back; this says
+-- what was attempted, blocked, or lost.
+CREATE TABLE IF NOT EXISTS dispatches (
+    id          TEXT PRIMARY KEY,
+    run_id      TEXT NOT NULL REFERENCES runs(run_id),
+    plan_id     TEXT NOT NULL,
+    unit_id     TEXT,
+    identity    TEXT NOT NULL,         -- label, never a secret
+    method      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    outcome     TEXT NOT NULL
+        CHECK (outcome IN ('vetoed', 'over_budget', 'sent', 'recorded', 'broker_error', 'record_mismatch')),
+    ledger_id   TEXT REFERENCES ledger(id),
+    detail      TEXT,
+    ts          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dispatches_run ON dispatches(run_id);
+
 -- Final, reported findings. Severity only ever set once status = confirmed.
 CREATE TABLE IF NOT EXISTS findings (
     fingerprint    TEXT NOT NULL,

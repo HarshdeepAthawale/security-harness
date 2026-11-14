@@ -85,11 +85,25 @@ class Candidate:
 
 @dataclass
 class Budget:
-    """Reserved before hunting starts — hunters can never eat validator reserve."""
+    """Reserved before hunting starts — hunters can never eat validator reserve.
+
+    max_requests caps traffic to the target: every request the kernel lets
+    through (hunts AND replays) counts, whatever Brains or the Judge ask for.
+    The hunter/validator caps count AI calls, which say nothing about how
+    many requests one call can produce.
+    """
     max_hunter_calls: int
     max_validator_calls: int
     used_hunter_calls: int = 0
     used_validator_calls: int = 0
+    max_requests: int = 1000
+    used_requests: int = 0
+
+    def spend_request(self, n: int = 1) -> bool:
+        if self.used_requests + n > self.max_requests:
+            return False
+        self.used_requests += n
+        return True
 
     def reserve_validator(self, n: int) -> bool:
         if self.used_validator_calls + n > self.max_validator_calls:

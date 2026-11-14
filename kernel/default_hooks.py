@@ -112,8 +112,13 @@ def require_cleanup(ctx: dict) -> None:
 
 
 def register_default_hooks(registry: HookRegistry) -> HookRegistry:
+    """Install the Constitution hooks. Idempotent: calling it twice on the
+    same registry doesn't run each rule twice."""
+    if getattr(registry, "_defaults_installed", False):
+        return registry
     registry.register("session_start", check_contract)
     registry.register("pre_broker_request", enforce_scope)
     registry.register("post_broker_request", check_stop_conditions)
     registry.register("session_end", require_cleanup)
+    registry._defaults_installed = True
     return registry

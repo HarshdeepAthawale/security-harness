@@ -18,7 +18,10 @@ import sqlite3
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Protocol
 
+from urllib.parse import urlparse
+
 from kernel import findings, leases, state
+from kernel.default_hooks import register_default_hooks
 from kernel.hooks import HookRegistry, HookVeto, StopCondition
 from kernel.models import Budget, Contract, LedgerEntry, RequestPlan, new_id, now_iso
 
@@ -119,8 +122,13 @@ _METHOD_ACTION = {"GET": "read", "HEAD": "read", "POST": "create", "PUT": "updat
 
 class Orchestrator:
     def __init__(self, conn: sqlite3.Connection, hooks: HookRegistry | None = None) -> None:
+        """`hooks` adds rules on top of the defaults. The default hooks (scope,
+        contract check, stop conditions, cleanup) are ALWAYS installed: safety
+        can't depend on the caller remembering to register it."""
         self.conn = conn
-        self.hooks = hooks or HookRegistry()
+        self.hooks = register_default_hooks(hooks or HookRegistry())
+        self._budget: Budget | None = None          # set while run()/resume() is active
+        self._max_plans = 20
 
     # -- run lifecycle -----------------------------------------------------
 
@@ -221,13 +229,97 @@ class Orchestrator:
     # -- broker dispatch (fires the enforcement hooks) ----------------------
 
     def dispatch(self, plan: RequestPlan, contract: Contract, broker: Broker) -> LedgerEntry:
-        """Send one request plan through the broker, with hook enforcement
-        on both sides. This is the ONLY path a plan takes to the network."""
-        self.hooks.fire("pre_broker_request", {"plan": plan, "contract": contract})
-        entry = _call("broker", broker.send, plan, contract)
+        """Send one request plan through the broker. This is the ONLY path a
+        plan takes to the network. In order:
+
+          1. scope hooks (veto = blocked, logged, never retried)
+          2. request budget (over budget = the run stops)
+          3. write-ahead log: the attempt is recorded BEFORE the broker runs
+          4. broker.send
+          5. the broker's record is checked against the plan; the kernel,
+             not the broker, assigns the ledger id, run and identity
+          6. ledger row, then stop-condition hooks
+        """
+        dispatch_id = new_id("dsp")
+        try:
+            self.hooks.fire("pre_broker_request", {"plan": plan, "contract": contract})
+        except HookVeto as veto:
+            self._log_dispatch(dispatch_id, plan, contract, "vetoed", detail=veto.reason)
+            raise
+        if self._budget is not None:
+            if not self._budget.spend_request():
+                self._log_dispatch(dispatch_id, plan, contract, "over_budget")
+                raise StopCondition(f"request budget exhausted ({self._budget.max_requests} requests)")
+            self._save_budget(contract.run_id, self._budget)
+
+        self._log_dispatch(dispatch_id, plan, contract, "sent")
+        try:
+            entry = _call("broker", broker.send, plan, contract)
+            if not isinstance(entry, LedgerEntry):
+                raise ComponentError("broker", TypeError(f"send() returned {type(entry).__name__}, not LedgerEntry"))
+        except ComponentError as error:
+            self._set_dispatch(dispatch_id, "broker_error", detail=str(error))
+            raise
+
+        mismatch = self._check_broker_record(entry, plan, contract)
+        entry.id = new_id("ledg")                      # ids are the kernel's, not the broker's
+        entry.run_id = contract.run_id
+        entry.identity_id = self._identity_id(contract.run_id, plan.identity)
         self._write_ledger_entry(entry)
+        if mismatch:
+            self._set_dispatch(dispatch_id, "record_mismatch", ledger_id=entry.id, detail=mismatch)
+            raise StopCondition(f"broker record doesn't match the plan: {mismatch}")
+        self._set_dispatch(dispatch_id, "recorded", ledger_id=entry.id)
         self.hooks.fire("post_broker_request", {"entry": entry, "contract": contract})
         return entry
+
+    def _log_dispatch(self, dispatch_id: str, plan: RequestPlan, contract: Contract, outcome: str,
+                      detail: str | None = None) -> None:
+        self.conn.execute(
+            "INSERT INTO dispatches (id, run_id, plan_id, unit_id, identity, method, path, outcome, detail, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (dispatch_id, contract.run_id, plan.plan_id, plan.unit_id, plan.identity, plan.method.upper(),
+             plan.path, outcome, detail, now_iso()),
+        )
+
+    def _set_dispatch(self, dispatch_id: str, outcome: str, ledger_id: str | None = None,
+                      detail: str | None = None) -> None:
+        self.conn.execute(
+            "UPDATE dispatches SET outcome = ?, ledger_id = COALESCE(?, ledger_id), detail = COALESCE(?, detail) "
+            "WHERE id = ?",
+            (outcome, ledger_id, detail, dispatch_id),
+        )
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str | None, int | None]:
+        parsed = urlparse(url if "://" in url else "https://" + url)
+        default_port = {"http": 80, "https": 443}.get(parsed.scheme)
+        return parsed.scheme, parsed.hostname, parsed.port or default_port
+
+    def _check_broker_record(self, entry: LedgerEntry, plan: RequestPlan, contract: Contract) -> str | None:
+        """Does what the broker says it sent match what the kernel authorized?
+        A mismatch means the broker sent something else, or rewrote the path
+        after the scope check, so the run stops."""
+        problems = []
+        if str(entry.method).upper() != plan.method.upper():
+            problems.append(f"method {entry.method} != {plan.method}")
+        if self._origin(entry.url) not in {self._origin(o) for o in contract.allowed_origins}:
+            problems.append(f"origin of {entry.url} is not in allowed_origins")
+        plan_path = plan.path.split("#", 1)[0].split("?", 1)[0]
+        sent_path = urlparse(entry.url).path
+        if sent_path != plan_path:
+            problems.append(f"path {sent_path!r} != planned {plan_path!r}")
+        if entry.run_id != contract.run_id:
+            problems.append(f"run_id {entry.run_id!r} != {contract.run_id!r}")
+        if entry.status_code is not None and not isinstance(entry.status_code, int):
+            problems.append("status_code is not an integer")
+        return "; ".join(problems) or None
+
+    def _identity_id(self, run_id: str, label: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT id FROM identities WHERE run_id = ? AND label = ?", (run_id, label)
+        ).fetchone()
+        return row["id"] if row else None
 
     def _write_ledger_entry(self, entry: LedgerEntry) -> None:
         self.conn.execute(
@@ -239,10 +331,16 @@ class Orchestrator:
 
     # -- candidate acceptance (the anti-hallucination gate) ------------------
 
-    def accept_candidate(self, fingerprint: str, run_id: str, trace_json: str) -> bool:
+    def accept_candidate(self, fingerprint: str, run_id: str, trace_json: str, mark_grounded: bool = True) -> bool:
         """pre_candidate_accept: a candidate whose claimed requests have no
         matching ledger row is rejected. Enforced here before any hook runs,
-        then hooks get a chance to veto further."""
+        then hooks get a chance to veto further.
+
+        mark_grounded=False leaves an accepted candidate 'proposed'. The run
+        loop uses that: 'grounded' must mean "in the ledger AND reproduced on
+        replay", so it's only set after the judge's replay succeeds. A run
+        stopped between the two leaves it 'proposed', and resume() re-hunts it
+        instead of validating something that never reproduced."""
         trace = json.loads(trace_json)
         request_hashes = trace.get("request_hashes", [])
         if not request_hashes:
@@ -264,7 +362,8 @@ class Orchestrator:
             findings.set_candidate_status(self.conn, run_id, fingerprint, "rejected")
             return False
 
-        findings.set_candidate_status(self.conn, run_id, fingerprint, "grounded")
+        if mark_grounded:
+            findings.set_candidate_status(self.conn, run_id, fingerprint, "grounded")
         return True
 
     # -- validator assignment (Hunter != Validator invariant) ----------------
@@ -303,8 +402,12 @@ class Orchestrator:
         profile: str = "",
         batch_size: int = 10,
         min_validator_reserve: int = 1,
+        max_plans_per_unit: int = 20,
     ) -> RunResult:
-        """Start a NEW run. To continue an existing one, use resume()."""
+        """Start a NEW run. To continue an existing one, use resume().
+
+        max_plans_per_unit: a hunt that asks for more requests than this is
+        treated as a Brains fault, not silently truncated."""
         run_id = contract.run_id
         if self._run_exists(run_id):
             # Never touch an existing run from here — that's resume()'s job.
@@ -327,7 +430,7 @@ class Orchestrator:
             # 5–8. hunt, validate, report, terminal decision
             return self._hunt_validate_report(contract, budget, broker, judge, brains, batch_size)
 
-        return self._guarded(run_id, body)
+        return self._guarded(run_id, body, budget, max_plans_per_unit)
 
     def resume(
         self,
@@ -338,8 +441,10 @@ class Orchestrator:
         *,
         add_hunter_calls: int = 0,
         add_validator_calls: int = 0,
+        add_requests: int = 0,
         batch_size: int = 10,
         min_validator_reserve: int = 1,
+        max_plans_per_unit: int = 20,
     ) -> RunResult:
         """Continue a run that crashed (still 'in_progress') or stopped
         ('incomplete'). Picks up from the saved state: interrupted units are
@@ -359,6 +464,7 @@ class Orchestrator:
         budget = Budget(**json.loads(row["budget_json"]))
         budget.max_hunter_calls += add_hunter_calls
         budget.max_validator_calls += add_validator_calls
+        budget.max_requests += add_requests
 
         def body() -> RunResult:
             self.conn.execute("UPDATE runs SET status = 'in_progress', reason = NULL, ended_at = NULL WHERE run_id = ?",
@@ -373,11 +479,14 @@ class Orchestrator:
             self._budget_gate(budget, min_validator_reserve)
             return self._hunt_validate_report(contract, budget, broker, judge, brains, batch_size)
 
-        return self._guarded(run_id, body)
+        return self._guarded(run_id, body, budget, max_plans_per_unit)
 
-    def _guarded(self, run_id: str, body: Callable[[], RunResult]) -> RunResult:
+    def _guarded(self, run_id: str, body: Callable[[], RunResult], budget: Budget,
+                 max_plans_per_unit: int) -> RunResult:
         """Run body; whatever goes wrong, end the run as incomplete with the
-        exact reason, and free its leases so resume() can pick it up."""
+        exact reason, and free its leases so resume() can pick it up.
+        While body runs, every dispatch spends from `budget`."""
+        self._budget, self._max_plans = budget, max_plans_per_unit
         try:
             return body()
         except RunIncomplete as stop:
@@ -388,6 +497,8 @@ class Orchestrator:
             reason = f"unexpected veto: {veto.reason}"
         except Exception as error:  # a kernel bug: still never leave a run hanging
             reason = f"kernel error: {type(error).__name__}: {error}"
+        finally:
+            self._budget = None
 
         if not self._run_exists(run_id):
             return RunResult(run_id, "incomplete", reason)
@@ -403,6 +514,8 @@ class Orchestrator:
     def _budget_gate(budget: Budget, min_validator_reserve: int) -> None:
         if budget.max_validator_calls - budget.used_validator_calls < min_validator_reserve:
             raise RunIncomplete(f"budget cannot fund the minimum validator reserve ({min_validator_reserve})")
+        if budget.used_requests >= budget.max_requests:
+            raise RunIncomplete(f"request budget exhausted ({budget.max_requests} requests)")
 
     def _recover_interrupted(self, run_id: str) -> None:
         """Clean up what a crash or stop left behind, before continuing."""
@@ -469,6 +582,9 @@ class Orchestrator:
         plans = _call("brains", brains.hunt, unit, contract)
         if not plans:
             return "covered"
+        if len(plans) > self._max_plans:
+            raise ComponentError("brains", ValueError(
+                f"hunt() returned {len(plans)} plans for one unit; the limit is {self._max_plans}"))
         for plan in plans:
             if not isinstance(plan, RequestPlan):
                 raise ComponentError("brains", TypeError(f"hunt() returned {type(plan).__name__}, not RequestPlan"))
@@ -529,7 +645,7 @@ class Orchestrator:
             state.add_rejected_path(self.conn, thread_id, f"duplicate of {fingerprint}")
             return "covered"
 
-        if not self.accept_candidate(fingerprint, run_id, json.dumps(trace)):
+        if not self.accept_candidate(fingerprint, run_id, json.dumps(trace), mark_grounded=False):
             state.update_thread(self.conn, thread_id, status="rejected")
             return "covered"
 
@@ -565,8 +681,11 @@ class Orchestrator:
             state.add_rejected_path(self.conn, thread_id, not_reproduced_note)
             return "covered"
 
+        # Only now, with the replay done and its evidence checked, is it
+        # 'grounded'. One statement, so the status and trace can't diverge.
         self.conn.execute(
-            "UPDATE candidates SET trace_json = ?, updated_at = ? WHERE run_id = ? AND fingerprint = ?",
+            "UPDATE candidates SET trace_json = ?, status = 'grounded', updated_at = ? "
+            "WHERE run_id = ? AND fingerprint = ?",
             (json.dumps(trace), now_iso(), run_id, fingerprint),
         )
         state.update_thread(self.conn, thread_id, status="holding", next_step="independent validation")
