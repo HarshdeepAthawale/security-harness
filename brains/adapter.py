@@ -29,6 +29,7 @@ from .schemas import Endpoint, Hypothesis, JudgeResult, TestPlan
 LLMClient = Callable[[str, str], dict]
 
 BASELINE = "baseline"   # owner reads their own object
+CONTROL = "control"     # actor reads their own object (enforcing negative control)
 ATTACK = "attack"       # another identity reads the owner's object
 
 
@@ -46,7 +47,7 @@ def _fill(template: str, object_id: str) -> str:
 
 
 def plan_role(plan: dict) -> str:
-    """'baseline' or 'attack' for a plan dict in a candidate trace."""
+    """'baseline', 'control', or 'attack' for a plan in a candidate trace."""
     return plan.get("expect", "").split(":", 1)[0]
 
 
@@ -112,9 +113,24 @@ class IdorBrains:
         hypothesis = self.hypotheses.get((unit["method"], self._template.get((unit["method"], unit["endpoint"]), "")))
         expect_safe = hypothesis.test_plan.expected_if_safe if hypothesis else "403 or 404"
         common = dict(unit_id=unit["unit_id"], method=unit["method"], path=unit["endpoint"], pack="idor-bola")
+        resource_type = unit.get("resource_type")
+        actor_object = self.object_ids.get(resource_type, {}).get(actor)
+        template = self._template.get((unit["method"], unit["endpoint"]))
+        # A control must be the actor's own object at the same endpoint
+        # template. Without it, the Judge cannot distinguish an IDOR from an
+        # intentionally public resource or generic response.
+        if actor_object is None or template is None:
+            return [
+                RequestPlan(identity=owner, expect=f"{BASELINE}: 200 with {owner}'s data", **common),
+                RequestPlan(identity=actor, expect=f"{ATTACK}: {expect_safe}", **common),
+            ]
+        control_path = _fill(template, actor_object)
         return [
             RequestPlan(identity=owner, expect=f"{BASELINE}: 200 with {owner}'s data", **common),
+            # Keep the original baseline/attack pair as the leading plans for
+            # compatibility with existing consumers of the frozen trace.
             RequestPlan(identity=actor, expect=f"{ATTACK}: {expect_safe}", **common),
+            RequestPlan(identity=actor, expect=f"{CONTROL}: 200 with {actor}'s data", **{**common, "path": control_path}),
         ]
 
     def validate(self, trace: dict) -> str:
@@ -127,7 +143,19 @@ class IdorBrains:
         status, digests = trace["status_codes"], trace["resp_digests"]
         if status[attack] in (401, 403, 404):
             return "rejected"
-        if status[base] == status[attack] == 200 and digests[attack] and digests[attack] == digests[base]:
+        if CONTROL not in roles:
+            # Backwards-compatible second opinion for legacy traces. The
+            # deterministic Judge still refuses to confirm them without the
+            # control and trusted permission policy.
+            if status[base] == status[attack] == 200 and digests[attack] and digests[attack] == digests[base]:
+                return "confirmed"
+            return "needs_validation"
+        control = roles.index(CONTROL)
+        if status[base] == status[control] == status[attack] == 200 and (
+            digests[base] and digests[control] and digests[attack]
+            and digests[base] != digests[control]
+            and digests[attack] == digests[base]
+        ):
             return "confirmed"
         return "needs_validation"
 

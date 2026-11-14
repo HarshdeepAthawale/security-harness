@@ -29,6 +29,81 @@ def test_contract_tampered_after_signing():
         check_contract({"contract": contract})
 
 
+def test_permission_policy_is_covered_by_contract_signature():
+    rule = {
+        "identity": "user_B", "method": "GET", "path": "/api/orders/1",
+        "decision": "deny", "source": "owner-approved policy",
+    }
+    contract = make_contract(permission_rules=[rule])
+    check_contract({"contract": contract})
+    contract.permission_rules[0]["decision"] = "allow"
+    with pytest.raises(StopCondition, match="hash mismatch"):
+        check_contract({"contract": contract})
+
+
+def test_permission_policy_rejects_out_of_scope_paths():
+    contract = make_contract(permission_rules=[{
+        "identity": "user_B", "method": "GET", "path": "/admin/users",
+        "decision": "deny", "source": "owner-approved policy",
+    }])
+    with pytest.raises(StopCondition, match="in-scope"):
+        check_contract({"contract": contract})
+
+
+def test_permission_policy_requires_exact_path_and_nonblank_source():
+    rule = {
+        "identity": "user_B", "method": "GET", "path": "/api/orders/*",
+        "decision": "deny", "source": "owner-approved policy",
+    }
+    contract = make_contract(permission_rules=[rule])
+    with pytest.raises(StopCondition, match="exact in-scope path"):
+        check_contract({"contract": contract})
+    rule["path"] = "/api/orders/1"
+    rule["source"] = "  "
+    contract = make_contract(permission_rules=[rule])
+    with pytest.raises(StopCondition, match="whitespace"):
+        check_contract({"contract": contract})
+
+
+def test_permission_policy_rejects_duplicate_rules():
+    rule = {
+        "identity": "user_B", "method": "GET", "path": "/api/orders/1",
+        "decision": "deny", "source": "owner-approved policy",
+    }
+    contract = make_contract(permission_rules=[rule, dict(rule)])
+    with pytest.raises(StopCondition, match="duplicate permission rule"):
+        check_contract({"contract": contract})
+
+
+def test_fresh_identity_map_requires_distinct_permitted_handles():
+    contract = make_contract(
+        identities=["user_A", "user_B", "user_A_fresh"],
+        fresh_identity_map={"user_A": "user_A_fresh", "user_B": "user_A_fresh"},
+    )
+    with pytest.raises(StopCondition, match="unique"):
+        check_contract({"contract": contract})
+
+
+def test_fresh_identity_requires_distinct_credential_reference(tmp_path):
+    conn = connect_and_init(tmp_path / "fresh.db")
+    contract = make_contract(
+        identities=["user_A", "user_B", "user_B_fresh"],
+        fresh_identity_map={"user_B": "user_B_fresh"},
+    )
+    conn.execute(
+        "INSERT INTO runs (run_id, target, contract_hash, budget_json, started_at) "
+        "VALUES (?, ?, ?, '{}', 'now')",
+        (contract.run_id, contract.target, contract.contract_hash),
+    )
+    conn.executemany(
+        "INSERT INTO identities (id, run_id, role, label, cred_ref) VALUES (?, ?, 'attacker', ?, ?)",
+        [("id-b", contract.run_id, "user_B", "vault:shared"),
+         ("id-b-fresh", contract.run_id, "user_B_fresh", "vault:shared")],
+    )
+    with pytest.raises(StopCondition, match="distinct credential reference"):
+        check_contract({"contract": contract, "conn": conn})
+
+
 def test_target_not_in_allowed_origins():
     with pytest.raises(StopCondition, match="not in allowed_origins"):
         check_contract({"contract": make_contract(target="evil.test")})

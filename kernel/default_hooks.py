@@ -40,6 +40,65 @@ def check_contract(ctx: dict) -> None:
     if target_host not in {_host(o) for o in contract.allowed_origins}:
         raise StopCondition(f"target {contract.target!r} is not in allowed_origins")
 
+    if not isinstance(contract.permission_rules, list):
+        raise StopCondition("permission_rules must be a list")
+    rule_keys = {"identity", "method", "path", "decision", "source"}
+    seen_rules = set()
+    for index, rule in enumerate(contract.permission_rules):
+        if not isinstance(rule, dict) or set(rule) != rule_keys:
+            raise StopCondition(
+                f"permission rule {index} must contain exactly {sorted(rule_keys)}"
+            )
+        identity, method, path = rule["identity"], rule["method"], rule["path"]
+        decision, source = rule["decision"], rule["source"]
+        if not all(isinstance(value, str) and value for value in (identity, method, path, decision, source)):
+            raise StopCondition(f"permission rule {index} contains an empty or non-string value")
+        if not source.strip():
+            raise StopCondition(f"permission rule {index} source must not be whitespace")
+        if identity not in contract.identities:
+            raise StopCondition(f"permission rule {index} names an identity outside the contract")
+        if method != method.upper() or method not in {m.upper() for m in contract.allowed_methods}:
+            raise StopCondition(f"permission rule {index} names a method outside the contract")
+        try:
+            canonical = canonical_path(path)
+        except HookVeto as veto:
+            raise StopCondition(f"permission rule {index} has an unsafe path: {veto.reason}") from veto
+        if canonical != path or any(token in path for token in "*?[") or not any(
+            fnmatch(path, pattern) for pattern in contract.allowed_paths
+        ):
+            raise StopCondition(f"permission rule {index} path is not an exact in-scope path")
+        if decision not in {"allow", "deny"}:
+            raise StopCondition(f"permission rule {index} decision must be 'allow' or 'deny'")
+        key = (identity, method, path)
+        if key in seen_rules:
+            raise StopCondition(f"duplicate permission rule for {identity} {method} {path}")
+        seen_rules.add(key)
+
+    fresh_map = contract.fresh_identity_map
+    if not isinstance(fresh_map, dict):
+        raise StopCondition("fresh_identity_map must be an object")
+    if any(
+        not isinstance(original, str) or not isinstance(fresh, str)
+        or not original or not fresh or original == fresh
+        or original not in contract.identities or fresh not in contract.identities
+        for original, fresh in fresh_map.items()
+    ):
+        raise StopCondition("fresh_identity_map must map distinct permitted identity handles")
+    if len(set(fresh_map.values())) != len(fresh_map) or set(fresh_map).intersection(fresh_map.values()):
+        raise StopCondition("fresh_identity_map must use unique, non-chained fresh identity handles")
+    conn = ctx.get("conn")
+    if fresh_map and conn is not None:
+        for original, fresh in fresh_map.items():
+            rows = conn.execute(
+                "SELECT label, cred_ref FROM identities WHERE run_id = ? AND label IN (?, ?)",
+                (contract.run_id, original, fresh),
+            ).fetchall()
+            refs = {row["label"]: row["cred_ref"] for row in rows}
+            if original not in refs or fresh not in refs:
+                raise StopCondition("fresh_identity_map references identities not seeded for this run")
+            if not refs[original] or not refs[fresh] or refs[original] == refs[fresh]:
+                raise StopCondition("fresh replay identity must use a distinct credential reference")
+
 
 MAX_DECODE_ROUNDS = 5
 

@@ -182,12 +182,19 @@ class Orchestrator:
         )
         return identity_id
 
-    def seed_from_recon(self, run_id: str, objects: list[dict], wave: int = 1) -> int:
+    def seed_from_recon(
+        self, run_id: str, objects: list[dict], wave: int = 1,
+        replay_only_identities: set[str] | None = None,
+    ) -> int:
         """Turn Surface Mapper output into objects + coverage_units.
         One coverage unit per (object, action, identity). Returns units created."""
         idents = self.conn.execute(
             "SELECT id, label FROM identities WHERE run_id = ?", (run_id,)
         ).fetchall()
+        # Fresh credentials in the signed contract exist only for Judge
+        # grounding. Do not schedule them as ordinary hunter identities.
+        replay_only = replay_only_identities or set()
+        idents = [ident for ident in idents if ident["label"] not in replay_only]
         by_label = {r["label"]: r["id"] for r in idents}
         created = 0
         for obj in objects:
@@ -228,7 +235,9 @@ class Orchestrator:
 
     # -- broker dispatch (fires the enforcement hooks) ----------------------
 
-    def dispatch(self, plan: RequestPlan, contract: Contract, broker: Broker) -> LedgerEntry:
+    def dispatch(
+        self, plan: RequestPlan, contract: Contract, broker: Broker, *, is_replay: bool = False,
+    ) -> LedgerEntry:
         """Send one request plan through the broker. This is the ONLY path a
         plan takes to the network. In order:
 
@@ -241,6 +250,11 @@ class Orchestrator:
           6. ledger row, then stop-condition hooks
         """
         dispatch_id = new_id("dsp")
+        replay_only = set(contract.fresh_identity_map.values())
+        if plan.identity in replay_only and not is_replay:
+            reason = f"fresh identity {plan.identity!r} is reserved for Judge replay"
+            self._log_dispatch(dispatch_id, plan, contract, "vetoed", detail=reason)
+            raise HookVeto(reason)
         try:
             self.hooks.fire("pre_broker_request", {"plan": plan, "contract": contract})
         except HookVeto as veto:
@@ -423,7 +437,9 @@ class Orchestrator:
             self._readiness_gate(contract, broker)
             # 3. recon -> objects + coverage units
             objects = _call("brains", brains.surface_map, contract)
-            if self.seed_from_recon(run_id, objects) == 0:
+            if self.seed_from_recon(
+                run_id, objects, replay_only_identities=set(contract.fresh_identity_map.values()),
+            ) == 0:
                 raise RunIncomplete("recon produced no coverage units")
             # 4. budget gate
             self._budget_gate(budget, min_validator_reserve)
@@ -623,6 +639,9 @@ class Orchestrator:
             "ledger_ids": [e.id for e in entries],
             "status_codes": [e.status_code for e in entries],
             "resp_digests": [e.resp_digest for e in entries],
+            # Trusted policy comes from the signed contract, never from Brains.
+            "permission_rules": json.loads(json.dumps(contract.permission_rules)),
+            "fresh_identity_map": dict(contract.fresh_identity_map),
         }
 
         thread_id = state.create_thread(self.conn, run_id=run_id, hypothesis=title, unit_id=unit_id)
@@ -652,7 +671,7 @@ class Orchestrator:
         replayed: list[LedgerEntry] = []
 
         def replay(plan: RequestPlan) -> LedgerEntry:
-            entry = self.dispatch(plan, contract, broker)
+            entry = self.dispatch(plan, contract, broker, is_replay=True)
             replayed.append(entry)
             return entry
 

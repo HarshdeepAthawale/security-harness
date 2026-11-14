@@ -114,6 +114,19 @@ kernel drives it.
 - `ground(trace, run_id, replay)` re-runs the sequence. **Every replay must
   go through `replay(plan)`**, never straight to the network. That keeps
   replays scope-checked and logged.
+- The initial implementation is `judge.IdorJudge` (`judge/idor.py`). It
+  supports read-only GET/HEAD IDOR/BOLA traces. It checks the owner baseline,
+  actor-own-object negative control, and cross-owner attack; then replays that
+  minimal sequence through the Kernel. A finding is confirmable only when the
+  signed contract provides explicit allow/deny permission rules for all three
+  requests and fresh credential handles for the identities. Missing policy or
+  fresh handles leaves a reproducing candidate at `needs_validation`.
+- Permission rule shape:
+  `{"identity":"user_B","method":"GET","path":"/api/orders/1001","decision":"deny","source":"owner-approved policy"}`.
+  The Kernel validates these exact in-scope rules and includes them in the
+  contract hash. `fresh_identity_map` maps each original identity handle to a
+  distinct handle with newly provisioned credentials; these handles are
+  excluded from normal hunting and used only for Judge replay.
 - You get a **copy** of the trace. Changing anything else in it has no
   effect. Only `cleanup_done` (bool), `severity_hint` (str) and a minimized
   `ledger_ids` list come back, and they're checked: every id must be one of
@@ -145,14 +158,29 @@ conn = connect_and_init("run.db")
 orch = Orchestrator(conn)   # default safety hooks are always installed
 contract = Contract(run_id="run1", target="crapi.local", allowed_origins=["http://crapi.local"],
                     allowed_paths=["/api/*"], allowed_methods=["GET"],
-                    identities=["user_A", "user_B"], stop_conditions=[], contract_hash="")
+                    identities=["user_A", "user_B", "user_A_fresh", "user_B_fresh"],
+                    stop_conditions=[], contract_hash="",
+                    permission_rules=[
+                        {"identity": "user_A", "method": "GET", "path": "/api/orders/1001", "decision": "allow", "source": "owner-approved policy"},
+                        {"identity": "user_B", "method": "GET", "path": "/api/orders/2002", "decision": "allow", "source": "owner-approved policy"},
+                        {"identity": "user_B", "method": "GET", "path": "/api/orders/1001", "decision": "deny", "source": "owner-approved policy"},
+                        {"identity": "user_A", "method": "GET", "path": "/api/orders/2002", "decision": "deny", "source": "owner-approved policy"},
+                        # Include matching rules for fresh replay identities.
+                        {"identity": "user_A_fresh", "method": "GET", "path": "/api/orders/1001", "decision": "allow", "source": "owner-approved policy"},
+                        {"identity": "user_B_fresh", "method": "GET", "path": "/api/orders/2002", "decision": "allow", "source": "owner-approved policy"},
+                        {"identity": "user_B_fresh", "method": "GET", "path": "/api/orders/1001", "decision": "deny", "source": "owner-approved policy"},
+                        {"identity": "user_A_fresh", "method": "GET", "path": "/api/orders/2002", "decision": "deny", "source": "owner-approved policy"},
+                    ],
+                    fresh_identity_map={"user_A": "user_A_fresh", "user_B": "user_B_fresh"})
 contract.contract_hash = contract.compute_hash()   # "sign" the scope
 
 result = orch.run(
     contract, Budget(max_hunter_calls=100, max_validator_calls=20, max_requests=500),
     broker, judge, brains,
     identities=[{"label": "user_A", "role": "victim", "cred_ref": "vault:user_A"},
-                {"label": "user_B", "role": "attacker", "cred_ref": "vault:user_B"}],
+                {"label": "user_B", "role": "attacker", "cred_ref": "vault:user_B"},
+                {"label": "user_A_fresh", "role": "victim", "cred_ref": "vault:user_A_fresh"},
+                {"label": "user_B_fresh", "role": "attacker", "cred_ref": "vault:user_B_fresh"}],
 )
 print(result.status, result.reason, result.report)
 ```
@@ -214,8 +242,10 @@ pytest
 
 ## What's NOT here yet
 
-- Real Broker / Judge / Brains. The kernel is tested end-to-end against
-  the fakes in `tests/fakes.py` only.
+- Production Broker integration. `judge.IdorJudge` is integrated with the
+  signed Kernel contract's permission rules and fresh-identity replay map.
+  The Broker still needs to resolve those replay-only identity handles to
+  separately provisioned credentials.
 - Parallel hunters. `run()` hunts units one at a time; leases are in place
   so it can fan out later.
 - Per-unit database transactions. A crash mid-unit can leave partial
