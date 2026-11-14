@@ -89,6 +89,11 @@ kernel drives it.
 **Broker**
 - `send()` returns a `LedgerEntry`. The kernel writes it to the ledger;
   you don't touch the DB.
+- **The kernel checks your record against the plan.** `method` must match,
+  the URL's origin must be in `allowed_origins` (scheme, host and port), and
+  the URL's path must be exactly `plan.path`. Any difference stops the run.
+  The kernel sets the ledger `id`, `run_id` and `identity_id` itself, so
+  don't bother filling those in.
 - Send `plan.path` **exactly as given**. The kernel validated it in that
   form (dot segments, `//`, encoded slashes, backslashes are rejected).
   Don't re-decode or normalize it, or the scope check no longer holds.
@@ -109,10 +114,13 @@ kernel drives it.
 - `ground(trace, run_id, replay)` re-runs the sequence. **Every replay must
   go through `replay(plan)`**, never straight to the network. That keeps
   replays scope-checked and logged.
-- During `ground()` you may write `cleanup_done` (bool), `severity_hint`
-  (str) and a minimized `ledger_ids` list into the trace. The kernel saves
-  them. A confirmed finding without `cleanup_done=True` makes the run
-  `incomplete`.
+- You get a **copy** of the trace. Changing anything else in it has no
+  effect. Only `cleanup_done` (bool), `severity_hint` (str) and a minimized
+  `ledger_ids` list come back, and they're checked: every id must be one of
+  this candidate's exchanges or a replay you made. Citing any other id
+  rejects the candidate. A confirmed finding without `cleanup_done=True`
+  makes the run `incomplete`.
+- Replays count against the run's request budget like any other request.
 
 **Brains**
 - `surface_map()` returns
@@ -120,7 +128,9 @@ kernel drives it.
   The kernel turns each into one coverage unit per (object, action, identity).
 - `hunt(unit)` gets
   `{unit_id, object_id, resource_type, endpoint, method, action, identity, identity_role, owner_identity, wave}`
-  and returns `RequestPlan`s. Paths must be relative (`/api/...`).
+  and returns `RequestPlan`s. Paths must be relative (`/api/...`). At most
+  `max_plans_per_unit` (default 20) per unit; more is treated as a Brains
+  fault and stops the run.
 - `validate(trace)` is the independent second opinion. Only
   `confirmed` + `confirmed` (judge + validator) gives a confirmed finding.
 
@@ -128,20 +138,18 @@ kernel drives it.
 
 ```python
 from kernel.db import connect_and_init
-from kernel.default_hooks import register_default_hooks
-from kernel.hooks import HookRegistry
 from kernel.models import Budget, Contract
 from kernel.orchestrator import Orchestrator
 
 conn = connect_and_init("run.db")
-orch = Orchestrator(conn, register_default_hooks(HookRegistry()))
+orch = Orchestrator(conn)   # default safety hooks are always installed
 contract = Contract(run_id="run1", target="crapi.local", allowed_origins=["http://crapi.local"],
                     allowed_paths=["/api/*"], allowed_methods=["GET"],
                     identities=["user_A", "user_B"], stop_conditions=[], contract_hash="")
 contract.contract_hash = contract.compute_hash()   # "sign" the scope
 
 result = orch.run(
-    contract, Budget(max_hunter_calls=100, max_validator_calls=20),
+    contract, Budget(max_hunter_calls=100, max_validator_calls=20, max_requests=500),
     broker, judge, brains,
     identities=[{"label": "user_A", "role": "victim", "cred_ref": "vault:user_A"},
                 {"label": "user_B", "role": "attacker", "cred_ref": "vault:user_B"}],
@@ -173,7 +181,22 @@ different scope is a new run.
 later run still reports a bug found before, with
 `previously_confirmed_in` set to the earlier run's id.
 
+**Traffic limits.** `Budget.max_requests` (default 1000) caps every request
+the run sends to the target, replays included. The hunter/validator caps
+only count AI calls. A run that hits it ends `incomplete`, and
+`resume(..., add_requests=N)` continues it.
+
+**Dispatch log.** Every request the kernel is asked to send gets a row in
+`dispatches` **before** the broker is called: `vetoed`, `over_budget`,
+`sent`, then `recorded` (with its ledger id), `broker_error` or
+`record_mismatch`. A request that dies mid-flight is still on record. The
+log holds identity labels, never secrets.
+
 ## Default hooks (`kernel/default_hooks.py`)
+
+These are **always installed**: `Orchestrator(conn)` adds them itself, and
+any `hooks` you pass are added on top. Safety can't be switched off by
+forgetting to register it.
 
 | Hook | Rule |
 |---|---|
