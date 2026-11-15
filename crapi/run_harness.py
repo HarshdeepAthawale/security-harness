@@ -23,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 from brains.adapter import IdorBrains                       # noqa: E402
+from brains.coverage import format_coverage                 # noqa: E402
 from broker.src.kernel_broker import KernelBroker           # noqa: E402
 from broker.src.scope import ScopePolicy, ScopeValidator   # noqa: E402
 from crapi import seed                                      # noqa: E402
@@ -35,6 +36,7 @@ ORIGIN = "http://127.0.0.1:8888"
 ORDER_PREFIX = "/workshop/api/shop/orders"
 ORDER_TEMPLATE = ORDER_PREFIX + "/{order_id}"
 USERS = seed.USERS
+DEFAULT_SPEC = HERE / "upstream" / "openapi-spec" / "crapi-openapi-spec.json"
 
 
 def credentials_and_identities(env: dict) -> list[dict]:
@@ -67,6 +69,8 @@ def permission_rules(orders: dict) -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--llm", action="store_true", help="ask the configured model for hypotheses too")
+    parser.add_argument("--spec", default=str(DEFAULT_SPEC), help="OpenAPI spec to discover endpoints from")
+    parser.add_argument("--no-discovery", action="store_true", help="skip the spec; test only the one hand-listed endpoint")
     args = parser.parse_args()
 
     env, state = seed.load_env(), (json.loads(seed.STATE_FILE.read_text()) if seed.STATE_FILE.exists() else {})
@@ -96,10 +100,18 @@ def main() -> int:
     if args.llm:
         from brains.llm_client import make_llm_client
         llm = make_llm_client()
-    brains = IdorBrains(
-        [{"method": "GET", "path": ORDER_TEMPLATE, "auth_required": True}],
-        {"orders": {user: str(order_id) for user, order_id in orders.items()}},
-        llm_client=llm, use_llm=args.llm)
+    object_ids = {"orders": {user: str(order_id) for user, order_id in orders.items()}}
+    if args.no_discovery or not Path(args.spec).exists():
+        if not args.no_discovery:
+            print(f"no spec at {args.spec}: testing only the hand-listed endpoint (see crapi/README.md)")
+        brains = IdorBrains([{"method": "GET", "path": ORDER_TEMPLATE, "auth_required": True}], object_ids,
+                            llm_client=llm, use_llm=args.llm)
+    else:
+        # Endpoints come from the spec. What is TESTED is still decided by the
+        # signed contract (GET on orders only) and by which objects we hold ids for.
+        brains = IdorBrains.from_openapi(args.spec, object_ids, base_path="", llm_client=llm, use_llm=args.llm)
+        print(format_coverage(brains.coverage()))
+        print()
 
     db_path = HERE / "run.db"
     for suffix in ("", "-wal", "-shm", "-journal"):

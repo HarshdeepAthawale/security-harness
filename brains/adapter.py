@@ -21,6 +21,7 @@ from urllib.parse import quote
 
 from kernel.models import Contract, RequestPlan
 
+from .coverage import READ_METHODS, coverage_report, format_coverage
 from .hunt import generate_hypotheses
 from .recon import _PLACEHOLDER, build_recon_map
 from .report import build_report
@@ -59,8 +60,11 @@ class IdorBrains:
     object_ids: which object each identity owns, by resource type, e.g.
         {"orders": {"user_A": "1001", "user_B": "2002"}}. IDOR needs a real
         object that belongs to someone else, so the run must know these.
-    llm_client: (prompt, user_content) -> dict. Defaults to OpenRouter.
-        Pass use_llm=False to skip the model entirely.
+    llm_client: (prompt, user_content) -> dict. Defaults to the provider in
+        LLM_PROVIDER. Pass use_llm=False to skip the model entirely.
+    allow_write: also test POST/PUT/PATCH/DELETE endpoints. Off by default: an
+        attack request on those would change the victim's real data, and the
+        judge only confirms read-only proofs anyway.
     """
 
     def __init__(
@@ -69,18 +73,35 @@ class IdorBrains:
         object_ids: dict[str, dict[str, str]],
         llm_client: LLMClient | None = None,
         use_llm: bool = True,
+        allow_write: bool = False,
     ) -> None:
         self.raw_endpoints = raw_endpoints
         self.object_ids = object_ids
         self.use_llm = use_llm
         self.llm_client = llm_client
+        self.allow_write = allow_write
         self.hypotheses: dict[tuple[str, str], Hypothesis] = {}
         self._template: dict[tuple[str, str], str] = {}   # (method, concrete path) -> template path
+
+    @classmethod
+    def from_openapi(cls, spec, object_ids: dict[str, dict[str, str]], base_path: str | None = None, **kwargs):
+        """Discover the endpoints from an OpenAPI 3 / Swagger 2 spec (a dict, or
+        a .json/.yaml path) instead of a hand-written list. Reads the spec only;
+        sends nothing."""
+        from .openapi import endpoints_from_openapi
+        return cls(endpoints_from_openapi(spec, base_path=base_path), object_ids, **kwargs)
+
+    def coverage(self) -> dict:
+        """For every discovered endpoint: tested, or why not (brains/coverage.py)."""
+        return coverage_report(self.raw_endpoints, self.object_ids, self.allow_write)
 
     # -- kernel protocol -------------------------------------------------------
 
     def surface_map(self, contract: Contract) -> list[dict]:
-        recon = build_recon_map(self.raw_endpoints)
+        raw = self.raw_endpoints
+        if not self.allow_write:
+            raw = [e for e in raw if str(e.get("method", "")).upper() in READ_METHODS]
+        recon = build_recon_map(raw)
         if self.use_llm:
             llm = self.llm_client or _default_llm()
             for h in generate_hypotheses(recon, llm):
@@ -185,4 +206,8 @@ class IdorBrains:
                 evidence={"ledger_ids": f["evidence_refs"], "cleanup_done": f["cleanup_done"]},
                 notes=note,
             ))
-        return build_report(hypotheses, results)
+        text = build_report(hypotheses, results)
+        # Say what was NOT tested, so a clean report isn't read as "everything is fine".
+        if self.raw_endpoints:
+            text += "\n\n" + format_coverage(self.coverage())
+        return text

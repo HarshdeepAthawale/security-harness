@@ -65,6 +65,30 @@ python crapi/run_harness.py
   `--llm` also asks the configured model (`LLM_PROVIDER=ollama|openrouter`) for
   hypotheses; without it, no model is used.
 
+## Endpoint discovery and coverage
+
+`run_harness.py` no longer needs the endpoints typed in. It reads crAPI's own
+OpenAPI spec (`crapi/upstream/openapi-spec/crapi-openapi-spec.json`, 44
+operations) with `brains/openapi.py` and prints, for every operation, whether
+it was tested and why not:
+
+```
+Coverage: 44 operations discovered, 1 tested
+  tested 1 | needs_object_ids 3 | id_in_query 2 | not_read_only 20 | public 9 | no_object_id 9
+```
+
+Discovery only says what exists. What is *sent* is still decided by the signed
+contract (GET on `/workshop/api/shop/orders/*`) and by which object ids the run
+has, so reading the spec widens nothing: the run still sends the same 12
+requests to the same 2 paths. Write methods (POST/PUT/PATCH/DELETE) are never
+attacked unless `IdorBrains(..., allow_write=True)`.
+
+Not covered yet, and shown as such in every report: endpoints that need an
+object id nobody supplied (videos, vehicle location, community posts) and
+endpoints whose id is a query parameter (`mechanic_report?report_id=`). Options:
+`--spec PATH` for another spec, `--no-discovery` for the single hand-listed
+endpoint.
+
 ## Result of the first real run
 
 On a fresh crAPI the harness reported **2 confirmed findings**: user B can read
@@ -75,7 +99,7 @@ password or token is stored in `run.db`.
 
 Not yet covered: confirmed findings carry no severity (the judge doesn't set
 one), only this one endpoint is tested, and object ids come from `seed.py`
-rather than being discovered.
+rather than being discovered (the endpoints themselves are, see above).
 
 ## The bug it is looking for
 
