@@ -590,7 +590,11 @@ class ScopeValidator:
         if "GET" not in self.policy.allowed_methods:
             raise ScopeViolation("HTTP method is outside authorized scope")
 
-        self._check_path_value(path)
+        # The probe path is chosen by whoever wrote the scope file (it is policy,
+        # not agent input), so it need not sit inside allowed_path_prefixes: a
+        # target's only unauthenticated page is often "/", and listing "/" as a
+        # prefix would open the whole site to plans. It still has to be a safe path.
+        canonicalize_path(path)
 
         return self._mint(
             method="GET", url=self.origin + path, path=path, query={}, headers={},

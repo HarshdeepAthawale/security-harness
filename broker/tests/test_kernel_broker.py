@@ -154,6 +154,14 @@ def test_check_identity_passes_for_the_intended_app():
         assert server.header_values("Authorization") == []          # the probe carries no credential
 
 
+def test_the_probe_path_need_not_be_in_the_allowed_prefixes_but_plans_still_must_be():
+    with LocalServer(app) as server:
+        broker = KernelBroker(make_validator(server, allowed_path_prefixes=("/api/orders",)))
+        assert broker.check_identity(make_contract(target="127.0.0.1")) is True      # /api/health is outside the prefixes
+        with pytest.raises(ScopeViolation):
+            broker.send(kernel_plan(path="/api/health"), make_contract(target="127.0.0.1"))
+
+
 def test_check_identity_fails_for_a_different_app_on_the_same_port():
     with LocalServer(lambda h: reply(h, 200, {"app": "something-else"})) as server:
         assert KernelBroker(make_validator(server)).check_identity(make_contract(target="127.0.0.1")) is False

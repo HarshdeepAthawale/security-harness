@@ -1,0 +1,11 @@
+# Our additions to crAPI's docker-compose.yml (see crapi/README.md).
+#
+# crAPI's nginx refuses to start unless the host "crapi-chatbot" resolves, even
+# if nothing ever calls it. We skip the AI chatbot (it needs an LLM key and its
+# vector database fights the workshop service for port 8000), so give nginx a
+# placeholder for that name. The chatbot endpoints simply won't work, which is
+# fine: they are out of scope for this harness.
+services:
+  crapi-web:
+    extra_hosts:
+      - "crapi-chatbot:127.0.0.1"

@@ -7,3 +7,10 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# crAPI practice target: the upstream checkout and everything generated locally
+crapi/upstream/
+crapi/.env.local
+crapi/state.json
+crapi/*.db
+crapi/report.md
