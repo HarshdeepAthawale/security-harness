@@ -156,7 +156,7 @@ def canonicalize_path(path: str) -> str:
 
     current = path
 
-    for _ in range(6):
+    for _ in range(7):
 
         if "\\" in current:
             raise ScopeViolation("Backslashes are not allowed")
@@ -169,8 +169,19 @@ def canonicalize_path(path: str) -> str:
 
         segments = current.split("/")
 
-        if any(segment in {".", ".."} for segment in segments):
-            raise ScopeViolation("Path traversal detected")
+        for index, segment in enumerate(segments):
+
+            # Allow only leading and trailing empty segments.
+            if not segment:
+                if index not in (0, len(segments) - 1):
+                    raise ScopeViolation("Empty path segment")
+                continue
+
+            # Account for path parameters such as ..; and .;
+            segment_without_params = segment.split(";", 1)[0]
+
+            if segment_without_params in {".", ".."}:
+                raise ScopeViolation("Path traversal detected")
 
         decoded = unquote(current)
 
@@ -179,8 +190,12 @@ def canonicalize_path(path: str) -> str:
 
         current = decoded
 
-    raise ScopeViolation("Excessively encoded path")
+    # If decoding still changes the path after seven passes,
+    # reject it rather than authorize an ambiguous representation.
+    if unquote(current) != current:
+        raise ScopeViolation("Excessively encoded path")
 
+    return current
 
 def path_matches_prefix(path: str, prefix: str) -> bool:
     """

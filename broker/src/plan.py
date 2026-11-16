@@ -74,7 +74,58 @@ def has_traversal(path: str) -> bool:
             break
         current = decoded
     return False
+def path_problem(path: str) -> str | None:
+    """
+    Identify dangerous path structures independently of ScopeValidator.
 
+    Returns a reason when the path is unsafe, otherwise None.
+    """
+    if not isinstance(path, str):
+        return "invalid path"
+
+    if "\\" in path:
+        return "backslash"
+
+    current = path
+
+    for _ in range(7):
+        # Encoded separators must not become path separators
+        # after decoding.
+        if re.search(r"%(?:2f|5c)", current, re.IGNORECASE):
+            return "encoded separator"
+
+        # Reject malformed percent encoding.
+        if re.search(r"%(?![0-9a-fA-F]{2})", current):
+            return "malformed encoding"
+
+        decoded = unquote(current)
+
+        # Reject decoded control characters.
+        if any(ord(char) < 32 or ord(char) == 127 for char in decoded):
+            return "control character"
+
+        if decoded == current:
+            break
+
+        current = decoded
+
+    segments = current.split("/")
+
+    for index, segment in enumerate(segments):
+        # A trailing slash is permitted, but an empty
+        # segment in the middle of a path is not.
+        if not segment:
+            if index not in {0, len(segments) - 1}:
+                return "empty segment"
+            continue
+
+        # Some servers interpret /..; and /.; as dot segments.
+        base_segment = segment.split(";", 1)[0]
+
+        if base_segment in {".", ".."}:
+            return "dot segment"
+
+    return None
 
 class RequestPlan(BaseModel):
 
@@ -117,8 +168,10 @@ class RequestPlan(BaseModel):
             raise ValueError("Malformed URL encoding")
         if re.search(r"%(?:2f|5c|00)", value, re.IGNORECASE):
             raise ValueError("Encoded separators and null bytes are not allowed")
-        if has_traversal(value):
-            raise ValueError("Path traversal detected")
+        problem = path_problem(value)
+
+        if problem is not None:
+            raise ValueError(f"Unsafe path: {problem}")
         return value
 
     @field_validator("headers")
@@ -183,6 +236,7 @@ class RequestPlan(BaseModel):
         if not IDENTIFIER_PATTERN.fullmatch(value):
             raise ValueError("Invalid pack name")
         return value
+
 
     @field_validator("expect")
     @classmethod
