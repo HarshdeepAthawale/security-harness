@@ -1,4 +1,5 @@
 
+
 import pytest
 
 from broker.src.credentials import (
@@ -624,3 +625,4 @@ def test_exact_output_for_each_credential_type(store):
     }
 
     assert store.apply("anon", PROD) == {}
+

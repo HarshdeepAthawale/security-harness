@@ -1,6 +1,8 @@
 import ipaddress
 import re
 
+import httpx
+
 from dataclasses import dataclass
 from urllib.parse import urlsplit, unquote
 
@@ -21,9 +23,7 @@ class ScopeViolation(Exception):
 # --------------------------------------------------
 
 def normalize_hostname(host: str) -> str:
-    """
-    Normalize a hostname for consistent comparison.
-    """
+    """Normalize a hostname for consistent comparison."""
 
     if not isinstance(host, str) or not host:
         raise ValueError("Hostname cannot be empty")
@@ -47,8 +47,8 @@ def normalize_hostname(host: str) -> str:
 
     try:
         hostname = host.encode("idna").decode("ascii").lower()
-    except UnicodeError:
-        raise ValueError("Invalid hostname")
+    except UnicodeError as exc:
+        raise ValueError("Invalid hostname") from exc
 
     if len(hostname) > 253:
         raise ValueError("Hostname too long")
@@ -56,7 +56,6 @@ def normalize_hostname(host: str) -> str:
     labels = hostname.split(".")
 
     for label in labels:
-
         if not re.fullmatch(
             r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?",
             label,
@@ -64,56 +63,6 @@ def normalize_hostname(host: str) -> str:
             raise ValueError("Invalid hostname label")
 
     return hostname
-
-
-# --------------------------------------------------
-# HOST HEADER NORMALIZATION
-# --------------------------------------------------
-
-def normalize_host_header(value: str) -> str:
-    """
-    Normalize a Host header value.
-
-    Examples:
-        Example.com       -> example.com
-        Example.com:443   -> example.com:443
-        [::1]:8080        -> [::1]:8080
-    """
-
-    if not isinstance(value, str) or not value:
-        raise ValueError("Host header cannot be empty")
-
-    try:
-        parsed = urlsplit("//" + value)
-
-        if (
-            not parsed.hostname
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            raise ValueError("Invalid Host header")
-
-        hostname = normalize_hostname(parsed.hostname)
-
-        port = parsed.port
-
-        if port is not None and not 1 <= port <= 65535:
-            raise ValueError("Invalid port")
-
-        # IPv6 requires square brackets in Host syntax.
-        if ":" in hostname:
-            hostname = f"[{hostname}]"
-
-        if port is not None:
-            return f"{hostname}:{port}"
-
-        return hostname
-
-    except (ValueError, UnicodeError):
-        raise ValueError("Malformed Host header")
 
 
 # --------------------------------------------------
@@ -127,7 +76,7 @@ def normalize_origin(base_url: str) -> str:
     Only an origin is accepted:
         https://example.com
 
-    Paths, queries and fragments are not accepted here.
+    Paths, queries and fragments are not accepted.
     """
 
     if not isinstance(base_url, str) or not base_url:
@@ -154,6 +103,9 @@ def normalize_origin(base_url: str) -> str:
             raise ValueError("Query and fragment are not allowed")
 
         hostname = normalize_hostname(parsed.hostname)
+
+        if parsed.netloc.endswith(":"):
+            raise ValueError("Empty target port")
 
         port = parsed.port
 
@@ -190,8 +142,17 @@ def canonicalize_path(path: str) -> str:
     Decode the path for scope comparison.
 
     The original request path is still sent to the target.
-    This canonical form is only used to check authorization.
+    The canonical form is only used for authorization.
     """
+
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ScopeViolation("Invalid request path")
+
+    if path.startswith("//"):
+        raise ScopeViolation("Protocol-relative paths are not allowed")
+
+    if "?" in path or "#" in path:
+        raise ScopeViolation("Query and fragments are not allowed in path")
 
     current = path
 
@@ -199,6 +160,12 @@ def canonicalize_path(path: str) -> str:
 
         if "\\" in current:
             raise ScopeViolation("Backslashes are not allowed")
+
+        if any(ord(char) < 32 or ord(char) == 127 for char in current):
+            raise ScopeViolation("Control characters in path")
+
+        if re.search(r"%(?![0-9a-fA-F]{2})", current):
+            raise ScopeViolation("Malformed URL encoding")
 
         segments = current.split("/")
 
@@ -208,15 +175,11 @@ def canonicalize_path(path: str) -> str:
         decoded = unquote(current)
 
         if decoded == current:
-            break
+            return current
 
         current = decoded
 
-    else:
-        # Too many nested encoding layers.
-        raise ScopeViolation("Excessively encoded path")
-
-    return current
+    raise ScopeViolation("Excessively encoded path")
 
 
 def path_matches_prefix(path: str, prefix: str) -> bool:
@@ -262,12 +225,6 @@ class ScopePolicy:
     # Authorized test identities.
     allowed_identities: frozenset[str]
 
-    # Host-header testing requires explicit authorization.
-    allow_host_header_override: bool = False
-
-    # Optional Host header allowlist.
-    allowed_host_header_values: frozenset[str] = frozenset()
-
 
 # --------------------------------------------------
 # SCOPE VALIDATOR
@@ -307,17 +264,6 @@ class ScopeValidator:
                 raise ValueError("Invalid path prefix")
 
             canonicalize_path(prefix)
-
-        # Normalize Host allowlist once.
-        normalized_hosts = set()
-
-        for host in policy.allowed_host_header_values:
-
-            normalized_hosts.add(
-                normalize_host_header(host)
-            )
-
-        self.allowed_hosts = frozenset(normalized_hosts)
 
     # --------------------------------------------------
     # METHOD CHECK
@@ -372,55 +318,43 @@ class ScopeValidator:
         )
 
     # --------------------------------------------------
-    # HOST HEADER CHECK
-    # --------------------------------------------------
-
-    def _check_host_header(self, plan: RequestPlan):
-
-        host_value = next(
-            (
-                value
-                for name, value in plan.headers.items()
-                if name.lower() == "host"
-            ),
-            None,
-        )
-
-        # No override requested.
-        if host_value is None:
-            return
-
-        if not self.policy.allow_host_header_override:
-            raise ScopeViolation(
-                "Host header override is not authorized"
-            )
-
-        normalized_host = normalize_host_header(host_value)
-
-        # If an allowlist exists, enforce it.
-        if self.allowed_hosts:
-
-            if normalized_host not in self.allowed_hosts:
-                raise ScopeViolation(
-                    "Host header value is not authorized"
-                )
-
-    # --------------------------------------------------
     # MAIN VALIDATION
     # --------------------------------------------------
 
     def validate(self, plan: RequestPlan) -> str:
+        """
+        Validate the complete request against engagement scope.
+
+        Returns the canonical destination URL (trusted origin + validated
+        path + encoded query). This exact string must be what the executor
+        sends; the service must compare it to ExecutionRequest.url.
+
+        Host headers are not caller-controllable (plan.py reserves them), so
+        the destination and Host always come from the trusted origin.
+        """
 
         self._check_method(plan)
-
         self._check_pack(plan)
-
         self._check_identity(plan)
-
         self._check_path(plan)
 
-        self._check_host_header(plan)
+        if any(name.lower() == "host" for name in plan.headers):
+            raise ScopeViolation("Host header override is not supported")
 
-        # Destination comes exclusively from trusted configuration.
-        # The Kernel never supplies the hostname.
-        return self.origin + plan.path
+        return self._canonical_url(plan)
+
+    def _canonical_url(self, plan: RequestPlan) -> str:
+
+        try:
+            url = httpx.URL(self.origin + plan.path, params=plan.query or None)
+        except (httpx.InvalidURL, ValueError, TypeError) as exc:
+            raise ScopeViolation("Request URL cannot be constructed") from exc
+
+        canonical = str(url)
+
+        # The path/host the client will send must be exactly what was
+        # authorized: no re-encoding, no host change.
+        if canonical.split("?", 1)[0] != self.origin + plan.path:
+            raise ScopeViolation("Request URL is not in canonical form")
+
+        return canonical

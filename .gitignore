@@ -1,9 +1,9 @@
-__pycache__/
-*.pyc
-.pytest_cache/
-*.db
-*.db-journal
-*.db-wal
-.venv/
 venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pem
+*.key
+credentials.json
+ledger*.jsonl
 .env

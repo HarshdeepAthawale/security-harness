@@ -69,7 +69,6 @@ def scope_policy():
             "admin",
         }),
 
-        allow_host_header_override=False,
     )
 
 
