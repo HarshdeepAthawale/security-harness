@@ -21,6 +21,7 @@ from urllib.parse import quote
 
 from kernel.models import Contract, RequestPlan
 
+from .coverage import READ_METHODS, coverage_report, format_coverage
 from .hunt import generate_hypotheses
 from .recon import _PLACEHOLDER, build_recon_map
 from .report import build_report
@@ -29,6 +30,7 @@ from .schemas import Endpoint, Hypothesis, JudgeResult, TestPlan
 LLMClient = Callable[[str, str], dict]
 
 BASELINE = "baseline"   # owner reads their own object
+CONTROL = "control"     # actor reads their own object (enforcing negative control)
 ATTACK = "attack"       # another identity reads the owner's object
 
 
@@ -46,7 +48,7 @@ def _fill(template: str, object_id: str) -> str:
 
 
 def plan_role(plan: dict) -> str:
-    """'baseline' or 'attack' for a plan dict in a candidate trace."""
+    """'baseline', 'control', or 'attack' for a plan in a candidate trace."""
     return plan.get("expect", "").split(":", 1)[0]
 
 
@@ -58,8 +60,11 @@ class IdorBrains:
     object_ids: which object each identity owns, by resource type, e.g.
         {"orders": {"user_A": "1001", "user_B": "2002"}}. IDOR needs a real
         object that belongs to someone else, so the run must know these.
-    llm_client: (prompt, user_content) -> dict. Defaults to OpenRouter.
-        Pass use_llm=False to skip the model entirely.
+    llm_client: (prompt, user_content) -> dict. Defaults to the provider in
+        LLM_PROVIDER. Pass use_llm=False to skip the model entirely.
+    allow_write: also test POST/PUT/PATCH/DELETE endpoints. Off by default: an
+        attack request on those would change the victim's real data, and the
+        judge only confirms read-only proofs anyway.
     """
 
     def __init__(
@@ -68,18 +73,35 @@ class IdorBrains:
         object_ids: dict[str, dict[str, str]],
         llm_client: LLMClient | None = None,
         use_llm: bool = True,
+        allow_write: bool = False,
     ) -> None:
         self.raw_endpoints = raw_endpoints
         self.object_ids = object_ids
         self.use_llm = use_llm
         self.llm_client = llm_client
+        self.allow_write = allow_write
         self.hypotheses: dict[tuple[str, str], Hypothesis] = {}
         self._template: dict[tuple[str, str], str] = {}   # (method, concrete path) -> template path
+
+    @classmethod
+    def from_openapi(cls, spec, object_ids: dict[str, dict[str, str]], base_path: str | None = None, **kwargs):
+        """Discover the endpoints from an OpenAPI 3 / Swagger 2 spec (a dict, or
+        a .json/.yaml path) instead of a hand-written list. Reads the spec only;
+        sends nothing."""
+        from .openapi import endpoints_from_openapi
+        return cls(endpoints_from_openapi(spec, base_path=base_path), object_ids, **kwargs)
+
+    def coverage(self) -> dict:
+        """For every discovered endpoint: tested, or why not (brains/coverage.py)."""
+        return coverage_report(self.raw_endpoints, self.object_ids, self.allow_write)
 
     # -- kernel protocol -------------------------------------------------------
 
     def surface_map(self, contract: Contract) -> list[dict]:
-        recon = build_recon_map(self.raw_endpoints)
+        raw = self.raw_endpoints
+        if not self.allow_write:
+            raw = [e for e in raw if str(e.get("method", "")).upper() in READ_METHODS]
+        recon = build_recon_map(raw)
         if self.use_llm:
             llm = self.llm_client or _default_llm()
             for h in generate_hypotheses(recon, llm):
@@ -112,9 +134,24 @@ class IdorBrains:
         hypothesis = self.hypotheses.get((unit["method"], self._template.get((unit["method"], unit["endpoint"]), "")))
         expect_safe = hypothesis.test_plan.expected_if_safe if hypothesis else "403 or 404"
         common = dict(unit_id=unit["unit_id"], method=unit["method"], path=unit["endpoint"], pack="idor-bola")
+        resource_type = unit.get("resource_type")
+        actor_object = self.object_ids.get(resource_type, {}).get(actor)
+        template = self._template.get((unit["method"], unit["endpoint"]))
+        # A control must be the actor's own object at the same endpoint
+        # template. Without it, the Judge cannot distinguish an IDOR from an
+        # intentionally public resource or generic response.
+        if actor_object is None or template is None:
+            return [
+                RequestPlan(identity=owner, expect=f"{BASELINE}: 200 with {owner}'s data", **common),
+                RequestPlan(identity=actor, expect=f"{ATTACK}: {expect_safe}", **common),
+            ]
+        control_path = _fill(template, actor_object)
         return [
             RequestPlan(identity=owner, expect=f"{BASELINE}: 200 with {owner}'s data", **common),
+            # Keep the original baseline/attack pair as the leading plans for
+            # compatibility with existing consumers of the frozen trace.
             RequestPlan(identity=actor, expect=f"{ATTACK}: {expect_safe}", **common),
+            RequestPlan(identity=actor, expect=f"{CONTROL}: 200 with {actor}'s data", **{**common, "path": control_path}),
         ]
 
     def validate(self, trace: dict) -> str:
@@ -127,7 +164,19 @@ class IdorBrains:
         status, digests = trace["status_codes"], trace["resp_digests"]
         if status[attack] in (401, 403, 404):
             return "rejected"
-        if status[base] == status[attack] == 200 and digests[attack] and digests[attack] == digests[base]:
+        if CONTROL not in roles:
+            # Backwards-compatible second opinion for legacy traces. The
+            # deterministic Judge still refuses to confirm them without the
+            # control and trusted permission policy.
+            if status[base] == status[attack] == 200 and digests[attack] and digests[attack] == digests[base]:
+                return "confirmed"
+            return "needs_validation"
+        control = roles.index(CONTROL)
+        if status[base] == status[control] == status[attack] == 200 and (
+            digests[base] and digests[control] and digests[attack]
+            and digests[base] != digests[control]
+            and digests[attack] == digests[base]
+        ):
             return "confirmed"
         return "needs_validation"
 
@@ -157,4 +206,8 @@ class IdorBrains:
                 evidence={"ledger_ids": f["evidence_refs"], "cleanup_done": f["cleanup_done"]},
                 notes=note,
             ))
-        return build_report(hypotheses, results)
+        text = build_report(hypotheses, results)
+        # Say what was NOT tested, so a clean report isn't read as "everything is fine".
+        if self.raw_endpoints:
+            text += "\n\n" + format_coverage(self.coverage())
+        return text

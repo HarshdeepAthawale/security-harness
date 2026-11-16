@@ -129,6 +129,13 @@ class Contract:
     identities: list[str]          # identity labels permitted this run
     stop_conditions: list[str]     # e.g. "bot_challenge", "rate_limit"
     contract_hash: str
+    # Operator-authored rules in exact identity/method/path form. These are
+    # included in the signed contract hash and are copied to Judge traces by
+    # the Kernel; Brains cannot provide or rewrite them.
+    permission_rules: list[dict] = field(default_factory=list)
+    # Original identity handle -> separately provisioned credential handle
+    # for fresh grounding replays. Both handles must be in `identities`.
+    fresh_identity_map: dict[str, str] = field(default_factory=dict)
 
     def compute_hash(self) -> str:
         """Hash of every scope field. session_start refuses a contract whose
@@ -141,6 +148,11 @@ class Contract:
                 "allowed_methods": sorted(m.upper() for m in self.allowed_methods),
                 "identities": sorted(self.identities),
                 "stop_conditions": sorted(self.stop_conditions),
+                "permission_rules": sorted(
+                    self.permission_rules,
+                    key=lambda rule: json.dumps(rule, sort_keys=True, separators=(",", ":")),
+                ),
+                "fresh_identity_map": self.fresh_identity_map,
             },
             sort_keys=True,
         )

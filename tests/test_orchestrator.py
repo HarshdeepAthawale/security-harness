@@ -6,6 +6,7 @@ from kernel.db import connect_and_init
 from kernel.hooks import HookRegistry, HookVeto
 from kernel.models import Contract, LedgerEntry, RequestPlan, new_id
 from kernel.orchestrator import Orchestrator
+from tests.fakes import make_contract
 
 
 class FakeBroker:
@@ -73,6 +74,24 @@ def test_dispatch_writes_ledger_row(tmp_path):
     assert row is not None
     assert row["status_code"] == 200
     assert len(broker.sent) == 1
+
+
+def test_fresh_identity_is_rejected_outside_judge_replay(tmp_path):
+    conn = _seeded(tmp_path)
+    orch = Orchestrator(conn)
+    broker = FakeBroker()
+    contract = make_contract(
+        identities=["user_A", "user_B", "user_B_fresh"],
+        fresh_identity_map={"user_B": "user_B_fresh"},
+    )
+    plan = RequestPlan(unit_id="u1", identity="user_B_fresh", method="GET", path="/api/orders/1001")
+
+    with pytest.raises(HookVeto, match="reserved for Judge replay"):
+        orch.dispatch(plan, contract, broker)
+
+    assert broker.sent == []
+    outcome = conn.execute("SELECT outcome FROM dispatches ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert outcome["outcome"] == "vetoed"
 
 
 def test_pre_broker_request_hook_can_veto(tmp_path):
