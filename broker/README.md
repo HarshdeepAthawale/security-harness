@@ -1,91 +1,39 @@
-# Broker
+# Broker usage
 
-The only part of the harness that talks to the target. It checks every
-request against a scope file, attaches the credential itself, sends the
-request to an address it resolved and approved, and records what happened.
+    pip install -r broker/requirements.txt
+    python -m pytest broker/tests            # 587 tests; HTTPS tests skip without certs
 
-```
-kernel RequestPlan
-   -> KernelBroker.send()                       broker/src/kernel_broker.py
-   -> RequestPlan (pydantic, strict)            broker/src/plan.py
-   -> ScopeValidator.build() -> ValidatedRequest   broker/src/scope.py
-   -> execute()                                  broker/src/executor.py
-        resolve_pinned()   DNS guard, connects to the checked IP only
-        get_credential()   BROKER_SECRET_<IDENTITY> from the environment
-        response_summary() digest of the raw body, redacted sample
-   -> ledger (optional, Ed25519-signed hash chain)  broker/src/ledger.py
-   -> LedgerEntry back to the kernel
-```
+Generate a ledger signing key (Ed25519, PEM):
 
-## Use it from the kernel
+    python - <<'PY'
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    k = Ed25519PrivateKey.generate()
+    open("ledger_signing.key", "wb").write(k.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()))
+    PY
+    chmod 600 ledger_signing.key
 
-```python
-from broker.src.kernel_broker import KernelBroker
-from broker.src.scope import load_scope
+Run (one JSON plan per stdin line, one JSON result per stdout line):
 
-broker = KernelBroker(load_scope("scope.json"))        # add ledger=Ledger(path, key) for the signed log
-orchestrator.run(contract, budget, broker, judge, brains, identities=[...])
-```
+    chmod 600 broker/examples/credentials.json
+    python -m broker.src.service \
+        --scope broker/examples/scope.json \
+        --credentials broker/examples/credentials.json \
+        --ledger ledger.jsonl --signing-key ledger_signing.key \
+        < broker/examples/plan.jsonl
 
-Credentials come from the environment, one per identity label:
-`BROKER_SECRET_USER_A`, `BROKER_SECRET_USER_A_FRESH`, ... They never go in
-the scope file, the plan, the ledger or the database.
+Flags for lab targets: --allow-loopback, --allow-private (cloud metadata
+addresses stay blocked regardless). On WSL under /mnt/c, file modes are not
+real: either keep credentials inside the Linux filesystem (~/), or pass
+--allow-loose-file-perms.
 
-## The scope file
+Result fields: outcome (response | error | not_sent | internal_error | rejected),
+status, expectation (met | unmet | inconclusive), possibly_delivered, request_hash,
+digest, sample (redacted), headers (redacted). Rejections return only a code:
+invalid_plan | scope_violation | credential_error | body_not_allowed | build_error |
+dns_blocked | ledger_unavailable | internal_error.
 
-```json
-{
-  "base_url": "http://127.0.0.1:8888",
-  "allowed_methods": ["GET"],
-  "allowed_path_prefixes": ["/api"],
-  "allowed_packs": ["idor-bola"],
-  "allowed_identities": ["user_A", "user_B", "user_A_fresh", "user_B_fresh"],
-  "allowed_cidrs": ["127.0.0.0/8"],
-  "identity_probe": {"path": "/api/health", "status": 200, "marker": "my-app-name"}
-}
-```
-
-- `allowed_cidrs`: needed only when the target is on a private or loopback
-  address (a local crAPI). Public targets need nothing. Without it a private
-  address is refused, which stops a hostile name from pointing the broker at
-  your internal network or a cloud metadata address.
-- `identity_probe`: the readiness gate (PROJECT.md 7.1). A GET, sent with no
-  credential, must return this status with this marker in the body. **Without
-  it `check_identity()` fails closed and the run won't start.**
-
-## What it refuses
-
-| Case | Result |
-|---|---|
-| method, path, pack or identity outside the scope file | `out_of_scope`, nothing sent |
-| `..`, `..;`, `//`, `%00`, `%2f`, backslash, nested encoding | rejected, in the plan model AND the scope check |
-| plan sets `Authorization`, `Cookie`, `Host` (unless the scope allows a Host override) | rejected |
-| target resolves to a private / link-local / metadata address | `dns_address_denied` |
-| redirect | returned as the response, never followed |
-| response over 2 MB | `response_too_large` |
-| server slower than 30 s in total, even one byte at a time | `upstream_timeout` |
-| connection cut before the promised body arrived | `upstream_truncated` |
-
-Errors leave the broker as short stable codes, never messages.
-
-## What is stored
-
-The ledger and the returned sample hold a **redacted** sample (4 KB): JSON
-keys like `token`/`secret`/`password`/`session`, JWTs, `Bearer ...`, and the
-credential the broker itself sent are removed from the whole body before it is
-cut down. The **digest** is of the raw body, so the judge can still compare
-two responses exactly.
-
-## Tests
-
-`pytest` from the repo root runs `broker/tests` too. `test_ledger.py` is
-skipped where `cryptography` can't be installed (Windows on ARM has no
-wheel); it runs everywhere else.
-
-## Known limits
-
-- One request at a time; no connection reuse.
-- The signing key is read from disk by the same process that signs, so the
-  ledger shows tampering with the file, not a compromise of the broker.
-- Flags: only `bot_challenge` is detected. `auth_ambiguity` and
-  `destructive_effect` are not set yet.
+At startup, pending records with no completion are logged as
+"unfinished_pending ... outcome=unknown": the request may have been sent.

@@ -7,7 +7,6 @@ from broker.src.scope import (
     ScopeViolation,
     normalize_hostname,
     normalize_origin,
-    normalize_host_header,
 )
 
 
@@ -46,7 +45,6 @@ def policy():
             "admin",
         }),
 
-        allow_host_header_override=False,
     )
 
 
@@ -141,40 +139,6 @@ def test_reject_invalid_hostnames(hostname):
 
     with pytest.raises(ValueError):
         normalize_hostname(hostname)
-
-
-# --------------------------------------------------
-# HOST HEADER TESTS
-# --------------------------------------------------
-
-def test_normalize_host_header():
-
-    assert normalize_host_header(
-        "EXAMPLE.COM:8080"
-    ) == "example.com:8080"
-
-
-def test_normalize_ipv6_host_header():
-
-    assert normalize_host_header(
-        "[::1]:8080"
-    ) == "[::1]:8080"
-
-
-@pytest.mark.parametrize(
-    "host",
-    [
-        "",
-        "example.com/path",
-        "user@example.com",
-        "example.com:abc",
-        "example.com:99999",
-    ],
-)
-def test_reject_invalid_host_header(host):
-
-    with pytest.raises(ValueError):
-        normalize_host_header(host)
 
 
 # --------------------------------------------------
@@ -338,103 +302,47 @@ def test_rejects_unauthorized_identity(validator):
 
 
 # --------------------------------------------------
-# HOST OVERRIDE TESTS
+# HOST HEADER / CANONICAL URL
 # --------------------------------------------------
 
-def test_rejects_host_override_by_default(validator):
+def test_plan_cannot_carry_host_header():
+    # Host is reserved in plan.py, so it can never reach scope.
+    with pytest.raises(Exception):
+        make_plan(headers={"Host": "attacker.example.com"})
 
-    plan = make_plan(
-        headers={
-            "Host": "attacker.example.com"
-        }
+
+def test_scope_rejects_host_header_even_if_plan_validation_bypassed(validator):
+    plan = RequestPlan.model_construct(
+        identity="user_A", method="GET", path="/api/orders",
+        headers={"Host": "attacker.example.com"}, query={}, body=None,
+        pack="idor-bola", expect="200",
     )
-
     with pytest.raises(ScopeViolation):
         validator.validate(plan)
 
 
-def test_allows_host_override_when_enabled(policy):
-
-    enabled_policy = ScopePolicy(
-        base_url=policy.base_url,
-        allowed_methods=policy.allowed_methods,
-        allowed_path_prefixes=policy.allowed_path_prefixes,
-        allowed_packs=policy.allowed_packs,
-        allowed_identities=policy.allowed_identities,
-        allow_host_header_override=True,
-    )
-
-    validator = ScopeValidator(enabled_policy)
-
-    plan = make_plan(
-        headers={
-            "Host": "attacker.example.com"
-        }
-    )
-
-    # The returned destination must still be the trusted target.
-    result = validator.validate(plan)
-
-    assert result == (
-        "https://target.example.com/api/orders/1001"
-    )
+def test_query_is_encoded_into_canonical_url(validator):
+    plan = make_plan(query={"q": "a b&c=d", "n": 5, "tags": ["x", "y"]})
+    url = validator.validate(plan)
+    assert url.startswith("https://target.example.com/api/orders/1001?")
+    assert "a%20b%26c%3Dd" in url or "a+b%26c%3Dd" in url
+    assert "tags=x&tags=y" in url
 
 
-def test_host_override_allowlist(policy):
-
-    restricted_policy = ScopePolicy(
-        base_url=policy.base_url,
-        allowed_methods=policy.allowed_methods,
-        allowed_path_prefixes=policy.allowed_path_prefixes,
-        allowed_packs=policy.allowed_packs,
-        allowed_identities=policy.allowed_identities,
-        allow_host_header_override=True,
-        allowed_host_header_values=frozenset({
-            "staging.example.com",
-        }),
-    )
-
-    validator = ScopeValidator(restricted_policy)
-
-    valid_plan = make_plan(
-        headers={
-            "Host": "STAGING.EXAMPLE.COM"
-        }
-    )
-
-    invalid_plan = make_plan(
-        headers={
-            "Host": "attacker.example.com"
-        }
-    )
-
-    validator.validate(valid_plan)
-
-    with pytest.raises(ScopeViolation):
-        validator.validate(invalid_plan)
+def test_empty_query_adds_no_question_mark(validator):
+    assert "?" not in validator.validate(make_plan())
 
 
-def test_host_override_does_not_change_destination(policy):
+def test_non_canonical_path_rejected_even_if_plan_validation_bypassed(validator):
+    # httpx would re-encode these, so the authorized URL != the sent URL.
+    for path in ("/api/orders/\u00fc", "/api/orders/a b"):
+        plan = RequestPlan.model_construct(
+            identity="user_A", method="GET", path=path, headers={},
+            query={}, body=None, pack="idor-bola", expect="200",
+        )
+        with pytest.raises(ScopeViolation):
+            validator.validate(plan)
 
-    enabled_policy = ScopePolicy(
-        base_url=policy.base_url,
-        allowed_methods=policy.allowed_methods,
-        allowed_path_prefixes=policy.allowed_path_prefixes,
-        allowed_packs=policy.allowed_packs,
-        allowed_identities=policy.allowed_identities,
-        allow_host_header_override=True,
-    )
 
-    validator = ScopeValidator(enabled_policy)
-
-    plan = make_plan(
-        headers={
-            "Host": "evil.example.com"
-        }
-    )
-
-    destination = validator.validate(plan)
-
-    assert destination.startswith(
-        "https://target.example.com/"
-    )
+def test_destination_always_comes_from_trusted_origin(validator):
+    assert validator.validate(make_plan()).startswith("https://target.example.com/")

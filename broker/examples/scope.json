@@ -1,0 +1,7 @@
+{
+  "base_url": "https://target.example.com",
+  "allowed_methods": ["GET", "POST", "DELETE"],
+  "allowed_path_prefixes": ["/api"],
+  "allowed_packs": ["idor-bola"],
+  "allowed_identities": ["user_A", "user_B"]
+}

@@ -1,0 +1,2 @@
+{"identity":"user_A","method":"GET","path":"/api/orders/1001","pack":"idor-bola","expect":"200"}
+{"identity":"user_B","method":"GET","path":"/api/orders/1001","pack":"idor-bola","expect":"403/404"}

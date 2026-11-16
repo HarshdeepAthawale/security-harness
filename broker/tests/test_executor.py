@@ -1,206 +1,363 @@
-"""The executor against a real local HTTP server: real sockets, real headers,
-real timeouts. (This file used to be a skipped placeholder.)"""
-import json
-import time
+"""Executor unit tests. The transport is injected by overriding
+_make_transport in a subclass (the public API accepts no transport), and all
+mock bodies use stream= so tests run the same read path as production."""
 
+import asyncio
+import inspect
+import ssl
+
+import httpx
 import pytest
 
-from broker.src import executor as executor_module
-from broker.src import limits
-from broker.src.dns_guard import DNSPolicyError
-from broker.src.errors import BrokerError
-from broker.src.executor import execute
-from broker.src.plan import RequestPlan
-from broker.src.scope import ScopePolicy, ScopeValidator, ValidatedRequest
-from tests.localserver import LocalServer, reply
+from broker.src.dns_guard import DNSGuard, DNSResult
+from broker.src.executor import (
+    ExecutionConfig,
+    ExecutionRequest,
+    ExecutorClosedError,
+    HTTPExecutor,
+    RequestBuildError,
+)
 
-TOKEN = "tok-user-A-1234567890"
-
-
-@pytest.fixture(autouse=True)
-def secrets(monkeypatch):
-    monkeypatch.setenv("BROKER_SECRET_USER_A", TOKEN)
+pytestmark = pytest.mark.asyncio
 
 
-def validator_for(server, **policy):
-    base = dict(
-        base_url=server.origin, allowed_methods=frozenset({"GET", "POST"}), allowed_path_prefixes=("/api",),
-        allowed_packs=frozenset({"idor-bola"}), allowed_identities=frozenset({"user_A"}),
-        allowed_cidrs=("127.0.0.0/8",),
-    )
-    base.update(policy)
-    return ScopeValidator(ScopePolicy(**base))
+class SlowStream(httpx.AsyncByteStream):
+    def __init__(self, chunks, delay=0.0):
+        self.chunks, self.delay = chunks, delay
+
+    async def __aiter__(self):
+        for c in self.chunks:
+            await asyncio.sleep(self.delay)
+            yield c
 
 
-def build(validator, path="/api/x", **plan):
-    data = dict(identity="user_A", method="GET", path=path, pack="idor-bola", expect="200")
-    data.update(plan)
-    return validator.build(RequestPlan(**data))
+def ok(body=b"hello", status=200, headers=None):
+    return httpx.Response(status, headers=headers or {}, stream=httpx.ByteStream(body))
 
 
-def echo(handler):
-    reply(handler, 200, {"ok": True})
+class MockExecutor(HTTPExecutor):
+    def __init__(self, handler, config=None, address_policy=None):
+        self._mock = httpx.MockTransport(handler)
+        self.seen = []
+        super().__init__(config, address_policy)
+
+    def _make_transport(self, dns_result):
+        self.seen.append(dns_result)
+        return self._mock
 
 
-# -- the basics -----------------------------------------------------------------------
-
-def test_sends_the_credential_the_broker_owns_and_returns_a_digest():
-    with LocalServer(echo) as server:
-        result = execute(build(validator_for(server)))
-    assert result["status"] == 200 and len(result["digest"]) == 64
-    assert server.header_values("Authorization") == ["Bearer " + TOKEN]
-    assert server.header_values("Host") == [f"127.0.0.1:{server.port}"]
+@pytest.fixture
+def config():
+    return ExecutionConfig(timeout_seconds=1, max_response_bytes=1024,
+                           max_request_bytes=1024, max_concurrent_requests=2)
 
 
-def test_plan_headers_cannot_override_authorization():
-    with LocalServer(echo) as server:
-        with pytest.raises(Exception):
-            build(validator_for(server), headers={"Authorization": "Bearer stolen"})
+@pytest.fixture
+def dns():
+    return DNSResult("example.com", ("93.184.216.34",))
 
 
-def test_query_and_json_body_are_sent():
-    seen = {}
-
-    def app(handler):
-        length = int(handler.headers.get("Content-Length") or 0)
-        seen["body"] = handler.rfile.read(length)
-        seen["ctype"] = handler.headers.get("Content-Type")
-        reply(handler, 200, {})
-
-    with LocalServer(app) as server:
-        execute(build(validator_for(server), method="POST", query={"q": "a b", "n": 3}, body={"k": 1}))
-        assert server.log[0]["path"] == "/api/x?q=a+b&n=3"
-    assert json.loads(seen["body"]) == {"k": 1} and seen["ctype"] == "application/json"
+async def run(handler, dns, *, method="GET", url="https://example.com/",
+              config=None, headers=None, body=None):
+    async with MockExecutor(handler, config) as ex:
+        return await ex.execute_request(
+            ex.build_request(method, url, headers, body), dns)
 
 
-# -- the secrets bug ----------------------------------------------------------------------
-
-def test_a_token_in_a_large_response_is_not_stored():
-    secret = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyX0EifQ.sig-value-123"
-    big = json.dumps({"access_token": secret, "items": ["x" * 60] * 200}).encode()
-    with LocalServer(lambda h: reply(h, 200, big, {"Content-Type": "application/json"})) as server:
-        result = execute(build(validator_for(server)))
-    assert secret not in json.dumps(result)
-    assert len(result["digest"]) == 64                       # the judge can still compare responses
+# ---------------------------------------------------------------- success
+async def test_successful_request(dns):
+    r = await run(lambda req: ok(), dns)
+    assert r.http_success and r.body == b"hello" and r.error_code is None
+    assert r.request_possibly_delivered is True
 
 
-def test_a_server_echoing_our_credential_back_does_not_leak_it():
-    with LocalServer(lambda h: reply(h, 200, f"you sent {h.headers['Authorization']}".encode())) as server:
-        result = execute(build(validator_for(server)))
-    assert TOKEN not in json.dumps(result)
+async def test_404_is_transport_success_but_not_http_success(dns):
+    r = await run(lambda req: ok(b"no", 404), dns)
+    assert r.transport_success and not r.http_success and r.status_code == 404
 
 
-# -- the Host bug ---------------------------------------------------------------------------
-
-def test_a_host_override_replaces_the_default_it_does_not_add_a_second():
-    with LocalServer(echo) as server:
-        validator = validator_for(server, allow_host_header_override=True)
-        execute(build(validator, headers={"host": "vhost.example.com"}))
-        assert server.header_values("Host") == ["vhost.example.com"]
-
-
-def test_without_an_override_the_plan_cannot_set_host():
-    with LocalServer(echo) as server:
-        with pytest.raises(Exception):
-            build(validator_for(server), headers={"Host": "evil.example.com"})
+async def test_duplicate_response_headers_preserved(dns):
+    def h(req):
+        return httpx.Response(200, headers=[("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")],
+                              stream=httpx.ByteStream(b""))
+    r = await run(h, dns)
+    assert [v for k, v in r.headers if k.lower() == "set-cookie"] == ["a=1", "b=2"]
 
 
-# -- containment ---------------------------------------------------------------------------------
-
-def test_redirects_are_returned_not_followed():
-    other = []
-
-    with LocalServer(lambda h: (other.append(h.path), reply(h, 200, b"secret"))) as elsewhere:
-        with LocalServer(lambda h: reply(h, 302, b"", {"Location": elsewhere.origin + "/api/stolen"})) as server:
-            result = execute(build(validator_for(server)))
-    assert result["status"] == 302
-    assert other == []                                       # the redirect target was never contacted
+# ------------------------------------------------- request validation
+async def test_direct_construction_with_forbidden_header_rejected(config, dns):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        with pytest.raises(RequestBuildError):
+            await ex.execute_request(
+                ExecutionRequest("GET", "https://example.com/", {"Accept-Encoding": "gzip"}), dns)
 
 
-def test_a_target_on_a_private_address_is_refused_unless_listed():
-    with LocalServer(echo) as server:
-        with pytest.raises(DNSPolicyError, match="dns_address_denied"):
-            execute(build(validator_for(server, allowed_cidrs=())))
-        assert server.log == []
+async def test_noncanonical_url_rejected(config, dns):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        with pytest.raises(RequestBuildError):
+            await ex.execute_request(
+                ExecutionRequest("GET", "HTTPS://EXAMPLE.com:443/a/../b"), dns)
 
 
-def test_an_oversized_response_is_refused(monkeypatch):
-    monkeypatch.setattr(limits, "MAX_RESPONSE_BYTES", 1000)
-    with LocalServer(lambda h: reply(h, 200, b"x" * 5000)) as server:
-        with pytest.raises(BrokerError) as caught:
-            execute(build(validator_for(server)))
-    assert caught.value.code == "response_too_large"
+async def test_noncanonical_headers_or_body_rejected(config, dns):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        with pytest.raises(RequestBuildError):
+            await ex.execute_request(
+                ExecutionRequest("GET", "https://example.com/", {"X": "a\r\nB: c"}), dns)
+        with pytest.raises(RequestBuildError):
+            await ex.execute_request(
+                ExecutionRequest("GET", "https://example.com/", {}, "str-body"), dns)
 
 
-def test_a_slow_drip_response_hits_the_total_deadline(monkeypatch):
-    """One byte every 0.3 s never trips a per-read timeout. The total deadline must."""
-    monkeypatch.setattr(limits, "TOTAL_TIMEOUT_SECONDS", 1.0)
-    monkeypatch.setattr(limits, "READ_TIMEOUT_SECONDS", 5.0)
-
-    def drip(handler):
-        handler.send_response(200)
-        handler.send_header("Content-Length", "100")
-        handler.end_headers()
-        for _ in range(100):
-            handler.wfile.write(b"x")
-            handler.wfile.flush()
-            time.sleep(0.3)
-
-    with LocalServer(drip) as server:
-        started = time.monotonic()
-        with pytest.raises(BrokerError) as caught:
-            execute(build(validator_for(server)))
-        elapsed = time.monotonic() - started
-    assert caught.value.code == "upstream_timeout"
-    assert elapsed < 4, f"the 1 s deadline took {elapsed:.1f}s to fire"
+@pytest.mark.parametrize("headers", [
+    {"X": "a\r\nInjected: 1"}, {"X": "caf\u00e9"}, {"X": "a\x00b"}, {"a": "1", "A": "2"},
+    {"Host": "evil"}, {"Accept-Encoding": "gzip"}, {"Expect": "100-continue"},
+    {"Transfer-Encoding": "chunked"}, {"Connection": "close"},
+])
+async def test_bad_headers_rejected(headers):
+    ex = HTTPExecutor()
+    with pytest.raises(RequestBuildError):
+        ex.build_request("GET", "https://example.com/", headers)
 
 
-def test_a_connection_cut_mid_body_is_not_a_complete_response():
-    """http.client returns a half body without an error. The digest of half a
-    body would look like a real response, so the executor must refuse it."""
-    def cut(handler):
-        handler.send_response(200)
-        handler.send_header("Content-Length", "1000")
-        handler.end_headers()
-        handler.wfile.write(b"x" * 10)
-        handler.wfile.flush()
-        handler.connection.shutdown(2)
-
-    with LocalServer(cut) as server:
-        with pytest.raises(BrokerError) as caught:
-            execute(build(validator_for(server)))
-    assert caught.value.code == "upstream_truncated"
+@pytest.mark.parametrize("method", ["CONNECT", "TRACE", "FOO", "", "get x"])
+async def test_forbidden_methods(method):
+    with pytest.raises(RequestBuildError):
+        HTTPExecutor().build_request(method, "https://example.com/")
 
 
-def test_a_dead_server_is_an_upstream_error_not_a_crash():
-    with LocalServer(echo) as server:
-        validator = validator_for(server)
-        request = build(validator)
-    with pytest.raises(BrokerError) as caught:               # the server is stopped now
-        execute(request)
-    assert caught.value.code in {"upstream_error", "upstream_timeout"}
+@pytest.mark.parametrize("url", [
+    "https://user:pw@example.com/", "https://example.com/#frag", "https://example.com/ ",
+    "http://example.com/", "ftp://example.com/", "https://2130706433/", "https://0x7f.1/",
+    "https://017700000001/", "", "https:///path",
+])
+async def test_bad_urls_rejected(url):
+    with pytest.raises(RequestBuildError):
+        HTTPExecutor().build_request("GET", url)
 
 
-# -- a plan can't skip the scope check ---------------------------------------------------------------
-
-def test_a_validated_request_cannot_be_constructed_by_hand():
-    with LocalServer(echo) as server:
-        request = build(validator_for(server))
-        with pytest.raises(TypeError):
-            ValidatedRequest(method="GET", url="https://evil.example.com/", path="/", query={}, headers={},
-                             body=None, identity="user_A", pack="x", replay_safe=True, request_hash="h",
-                             target=request.target)
+async def test_body_must_be_bytes_and_bounded():
+    ex = HTTPExecutor(ExecutionConfig(max_request_bytes=10))
+    with pytest.raises(RequestBuildError):
+        ex.build_request("POST", "https://example.com/", body="text")
+    with pytest.raises(RequestBuildError):
+        ex.build_request("POST", "https://example.com/", body=b"x" * 11)
 
 
-def test_the_executor_refuses_anything_but_a_validated_request():
-    with pytest.raises(TypeError):
-        execute({"method": "GET", "url": "http://127.0.0.1/"})
+async def test_public_constructor_has_no_transport_parameter():
+    assert "transport" not in inspect.signature(HTTPExecutor.__init__).parameters
 
 
-def test_a_tampered_request_is_refused():
-    with LocalServer(echo) as server:
-        request = build(validator_for(server))
-        object.__setattr__(request, "url", request.url.replace("/api/x", "/api/y"))
-        with pytest.raises(ValueError, match="request_tampered"):
-            execute(request)
-        assert server.log == []
+# ------------------------------------------------- DNS pinning contract
+async def test_dns_result_required(config):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        req = ex.build_request("GET", "https://example.com/")
+        for bad in (None, "example.com", {"hostname": "example.com"}):
+            with pytest.raises(RequestBuildError):
+                await ex.execute_request(req, bad)
+
+
+async def test_dns_hostname_must_match_request(config):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        req = ex.build_request("GET", "https://example.com/")
+        with pytest.raises(RequestBuildError):
+            await ex.execute_request(req, DNSResult("other.com", ("93.184.216.34",)))
+
+
+async def test_hostname_match_is_case_and_dot_insensitive(config):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        req = ex.build_request("GET", "https://example.com/")
+        r = await ex.execute_request(req, DNSResult("EXAMPLE.com.", ("93.184.216.34",)))
+        assert r.http_success
+
+
+@pytest.mark.parametrize("addr", [
+    "127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.169.254", "::1",
+    "::ffff:127.0.0.1", "0.0.0.0", "fd00:ec2::254",
+])
+async def test_forged_dns_result_with_internal_address_rejected(config, addr):
+    async with MockExecutor(lambda r: pytest.fail("must not connect"), config) as ex:
+        req = ex.build_request("GET", "https://example.com/")
+        with pytest.raises(RequestBuildError, match="address policy"):
+            await ex.execute_request(req, DNSResult("example.com", (addr,)))
+        assert ex.seen == []                       # no transport was even created
+
+
+async def test_one_bad_address_among_good_rejects(config):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        req = ex.build_request("GET", "https://example.com/")
+        with pytest.raises(RequestBuildError):
+            await ex.execute_request(
+                req, DNSResult("example.com", ("93.184.216.34", "10.0.0.1")))
+
+
+async def test_metadata_never_allowed_even_with_permissive_policy(config):
+    permissive = DNSGuard(True, True, True, True)
+    async with MockExecutor(lambda r: ok(), config, permissive) as ex:
+        req = ex.build_request("GET", "https://example.com/")
+        with pytest.raises(RequestBuildError):
+            await ex.execute_request(req, DNSResult("example.com", ("169.254.169.254",)))
+
+
+async def test_loopback_allowed_only_when_policy_says_so(config):
+    async with MockExecutor(lambda r: ok(), config, DNSGuard(allow_loopback=True)) as ex:
+        req = ex.build_request("GET", "https://localhost/")
+        r = await ex.execute_request(req, DNSResult("localhost", ("127.0.0.1",)))
+        assert r.http_success
+
+
+async def test_transport_receives_validated_result(config, dns):
+    async with MockExecutor(lambda r: ok(), config) as ex:
+        await ex.execute_request(ex.build_request("GET", "https://example.com/"), dns)
+        assert ex.seen == [dns]
+
+
+# ------------------------------------------------- response handling
+async def test_compressed_response_rejected_headers_kept(dns):
+    r = await run(lambda req: ok(b"compressed data", headers={"Content-Encoding": "gzip"}), dns)
+    assert r.error_code == "unexpected_content_encoding"
+    assert r.status_code == 200 and r.body is None
+    assert ("content-encoding", "gzip") in r.headers
+
+
+async def test_redirect_not_followed(dns):
+    r = await run(lambda req: ok(b"", 302, {"Location": "http://169.254.169.254/"}), dns)
+    assert r.status_code == 302 and r.transport_success
+
+
+async def test_no_content_response(dns):
+    r = await run(lambda req: httpx.Response(204), dns, method="DELETE")
+    assert r.http_success and r.body == b""
+
+
+async def test_head_with_large_content_length_ok(dns):
+    r = await run(lambda req: httpx.Response(200, headers={"Content-Length": "999999999"}),
+                  dns, method="HEAD")
+    assert r.http_success and r.body == b""
+
+
+async def test_oversized_declared_length_rejected(config, dns):
+    r = await run(lambda req: ok(b"", headers={"Content-Length": "5000"}), dns, config=config)
+    assert r.error_code == "response_too_large" and r.body is None
+
+
+@pytest.mark.parametrize("value", ["abc", "-1"])
+async def test_bad_content_length_rejected(dns, value):
+    r = await run(lambda req: ok(b"", headers={"Content-Length": value}), dns)
+    assert r.error_code == "invalid_content_length"
+
+
+async def test_oversized_streamed_body_cut_off(config, dns):
+    r = await run(lambda req: httpx.Response(200, stream=SlowStream([b"x" * 600, b"x" * 600])),
+                  dns, config=config)
+    assert r.error_code == "response_too_large" and r.body is None
+
+
+# ------------------------------------------------- deadline / delivery
+async def test_slow_drip_hits_total_deadline(dns):
+    cfg = ExecutionConfig(timeout_seconds=0.3)
+    r = await run(lambda req: httpx.Response(200, stream=SlowStream([b"a"] * 50, 0.1)),
+                  dns, config=cfg)
+    assert r.error_code == "timeout" and r.request_possibly_delivered is True
+
+
+async def test_queue_timeout_is_not_delivered(dns):
+    cfg = ExecutionConfig(timeout_seconds=0.3, max_concurrent_requests=1)
+    async with MockExecutor(lambda r: ok(), cfg) as ex:
+        req = ex.build_request("GET", "https://example.com/")
+        await ex._semaphore.acquire()               # saturated pool
+        try:
+            r = await ex.execute_request(req, dns)
+        finally:
+            ex._semaphore.release()
+    assert r.error_code == "timeout" and r.request_possibly_delivered is False
+
+
+async def test_tls_failure_vs_refused_and_not_delivered(dns):
+    def tls(req):
+        raise httpx.ConnectError("x") from ssl.SSLCertVerificationError("bad")
+
+    def refused(req):
+        raise httpx.ConnectError("refused")
+
+    a, b = await run(tls, dns), await run(refused, dns)
+    assert (a.error_code, b.error_code) == ("tls_verification_failed", "connection_error")
+    assert not a.request_possibly_delivered and not b.request_possibly_delivered
+
+
+async def test_tls_detection_follows_context_like_httpcore(dns):
+    # httpcore sets the SSL error as __context__ (not __cause__) on ConnectError.
+    def h(req):
+        try:
+            raise ssl.SSLCertVerificationError("verify failed")
+        except ssl.SSLError:
+            raise httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED]")
+
+    assert (await run(h, dns)).error_code == "tls_verification_failed"
+
+
+async def test_read_timeout_is_possibly_delivered(dns):
+    def h(req):
+        raise httpx.ReadTimeout("slow")
+    r = await run(h, dns)
+    assert r.error_code == "read_timeout" and r.request_possibly_delivered is True
+
+
+async def test_connect_timeout_is_not_delivered(dns):
+    def h(req):
+        raise httpx.ConnectTimeout("slow")
+    r = await run(h, dns)
+    assert r.error_code == "connect_timeout" and r.request_possibly_delivered is False
+
+
+# ------------------------------------------------- lifecycle
+async def test_rejects_request_after_close(dns):
+    ex = MockExecutor(lambda r: ok())
+    req = ex.build_request("GET", "https://example.com/")
+    await ex.close()
+    with pytest.raises(ExecutorClosedError):
+        await ex.execute_request(req, dns)
+    with pytest.raises(ExecutorClosedError):
+        ex.build_request("GET", "https://example.com/")
+
+
+async def test_close_is_idempotent_and_concurrent():
+    ex = MockExecutor(lambda r: ok())
+    await asyncio.gather(ex.close(), ex.close(), ex.close())
+    await ex.close()
+
+
+async def test_close_waits_for_inflight_request(dns):
+    ex = MockExecutor(lambda r: httpx.Response(200, stream=SlowStream([b"a"], 0.2)),
+                      ExecutionConfig(timeout_seconds=2))
+    req = ex.build_request("GET", "https://example.com/")
+    task = asyncio.create_task(ex.execute_request(req, dns))
+    await asyncio.sleep(0.05)
+    await ex.close()
+    assert task.done() and task.result().http_success
+
+
+async def test_cancelled_close_does_not_abort_shutdown(dns):
+    ex = MockExecutor(lambda r: httpx.Response(200, stream=SlowStream([b"a"], 0.3)),
+                      ExecutionConfig(timeout_seconds=2))
+    req = ex.build_request("GET", "https://example.com/")
+    inflight = asyncio.create_task(ex.execute_request(req, dns))
+    await asyncio.sleep(0.05)
+    closer = asyncio.create_task(ex.close())
+    await asyncio.sleep(0.05)
+    closer.cancel()
+    await asyncio.gather(closer, return_exceptions=True)
+    await inflight
+    await ex.close()                                  # completes, not hung
+
+
+async def test_cancellation_propagates(dns):
+    ex = MockExecutor(lambda r: httpx.Response(200, stream=SlowStream([b"a"], 5)),
+                      ExecutionConfig(timeout_seconds=10))
+    req = ex.build_request("GET", "https://example.com/")
+    task = asyncio.create_task(ex.execute_request(req, dns))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await ex.close()                                  # counter was released

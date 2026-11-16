@@ -242,8 +242,10 @@ def test_rejects_invalid_paths(path):
     "proxy-authorization",
     "cookie",
 
-    # "host" is deliberately NOT here: the plan may carry one, and the scope
-    # check refuses it unless the policy enables a Host override (see test_scope.py).
+    # Destination control / executor-owned
+    "host",
+    "accept-encoding",
+    "expect",
 
     # HTTP message framing
     "content-length",
@@ -559,3 +561,51 @@ def test_rejects_unexpected_fields():
             expect="200",
             is_admin=True,
         )
+
+@pytest.mark.parametrize("path", [
+    "/api/\u00fc",            # non-ASCII
+    "/api/a b",                # space
+    "/api/\u202e",            # bidi control
+    "/api/a%00b",              # encoded null
+    "/api/a%2Fb",              # encoded slash
+    "/api/a%5Cb",              # encoded backslash
+    "/" + "a" * 2100,          # too long
+])
+def test_rejects_non_canonical_or_dangerous_paths(path):
+    with pytest.raises(ValidationError):
+        RequestPlan(identity="user_A", method="GET", path=path,
+                    pack="idor-bola", expect="200")
+
+
+def test_rejects_case_insensitive_duplicate_headers():
+    with pytest.raises(ValidationError):
+        RequestPlan(identity="user_A", method="GET", path="/a",
+                    headers={"X-Test": "1", "x-test": "2"},
+                    pack="idor-bola", expect="200")
+
+
+@pytest.mark.parametrize("value", ["caf\u00e9", "x" * 8193, "a\x00b", "a\x7fb"])
+def test_rejects_bad_header_values(value):
+    with pytest.raises(ValidationError):
+        RequestPlan(identity="user_A", method="GET", path="/a",
+                    headers={"X-Test": value}, pack="idor-bola", expect="200")
+
+
+@pytest.mark.parametrize("query", [
+    {"a": {"nested": 1}},
+    {"a": [[1]]},
+    {"a": object()},
+    {"": "x"},
+    {"a": float("inf")},
+])
+def test_rejects_non_scalar_query_values(query):
+    with pytest.raises(ValidationError):
+        RequestPlan(identity="user_A", method="GET", path="/a", query=query,
+                    pack="idor-bola", expect="200")
+
+
+def test_accepts_scalar_and_list_query_values():
+    plan = RequestPlan(identity="user_A", method="GET", path="/a",
+                       query={"a": 1, "b": "x", "c": True, "d": None, "e": ["x", 2]},
+                       pack="idor-bola", expect="200")
+    assert plan.query["e"] == ["x", 2]

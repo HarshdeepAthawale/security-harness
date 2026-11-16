@@ -1,7 +1,7 @@
 import pytest
 
 from broker.src.plan import RequestPlan
-from broker.src.scope import Scope, ScopePolicy, ScopeValidator
+from broker.src.scope import ScopePolicy, ScopeValidator
 
 
 # --------------------------------------------------
@@ -69,7 +69,6 @@ def scope_policy():
             "admin",
         }),
 
-        allow_host_header_override=False,
     )
 
 
@@ -83,11 +82,3 @@ def scope_validator(scope_policy):
     return ScopeValidator(scope_policy)
 
 
-# --------------------------------------------------
-# RESOLVED TARGET FIXTURE (DNS guard / executor)
-# --------------------------------------------------
-
-@pytest.fixture
-def scope():
-
-    return Scope(scheme="https", host="target.example.com", port=443)
